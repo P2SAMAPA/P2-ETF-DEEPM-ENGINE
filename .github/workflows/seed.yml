@@ -1,0 +1,40 @@
+name: Seed Dataset (run once)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: false
+        default: "2008-01-01"
+      end_date:
+        description: "End date (YYYY-MM-DD, leave blank for today)"
+        required: false
+        default: ""
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run seed
+        env:
+          HF_TOKEN:       ${{ secrets.HF_TOKEN }}
+          FRED_API_KEY:   ${{ secrets.FRED_API_KEY }}
+          HF_DATASET_REPO: "P2SAMAPA/p2-etf-deepm-data"
+        run: |
+          python seed.py \
+            --start "${{ github.event.inputs.start_date }}" \
+            ${{ github.event.inputs.end_date != '' && format('--end "{0}"', github.event.inputs.end_date) || '' }}
