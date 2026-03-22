@@ -1,6 +1,6 @@
-pandas==2.2.2
-numpy==1.26.4
-pyarrow==16.1.0
-plotly==5.22.0
-streamlit==1.35.0
-huggingface_hub==0.23.4
+pandas
+numpy
+pyarrow
+plotly
+streamlit
+huggingface_hub
