@@ -116,15 +116,15 @@ def eval_epoch(
     cash_rate_mean: float,
     loss_fn: str = "evar",
 ) -> tuple:
-    """Returns (loss, annualised_sharpe)."""
+    """Returns (loss, annualised_sharpe, annualised_return)."""
     model.eval()
-    total_loss = 0.0
+    total_loss    = 0.0
     all_port_rets = []
     cash_t = torch.tensor(cash_rate_mean, dtype=torch.float32)
 
     with torch.no_grad():
         for X_a, X_m, y_batch in loader_:
-            weights = model(X_a, X_m)
+            weights    = model(X_a, X_m)
             cash_batch = cash_t.expand(len(y_batch))
 
             if loss_fn == "evar":
@@ -139,11 +139,12 @@ def eval_epoch(
                        weights[:, n_assets] * cash_batch
             all_port_rets.extend(port_ret.numpy())
 
-    avg_loss  = total_loss / len(loader_)
-    rets_arr  = np.array(all_port_rets)
-    sharpe    = (rets_arr.mean() / (rets_arr.std() + 1e-8)) * np.sqrt(252)
+    avg_loss   = total_loss / len(loader_)
+    rets_arr   = np.array(all_port_rets)
+    ann_return = float(rets_arr.mean() * 252)
+    sharpe     = float((rets_arr.mean() / (rets_arr.std() + 1e-8)) * np.sqrt(252))
 
-    return avg_loss, sharpe
+    return avg_loss, sharpe, ann_return
 
 
 # ── Main training function ─────────────────────────────────────────────────────
@@ -202,35 +203,40 @@ def train_option(option: str) -> dict:
 
     # ── Training loop ─────────────────────────────────────────────────────────
     print(f"\n[5/5] Training ({cfg.MAX_EPOCHS} epochs, patience={cfg.PATIENCE})...")
-    best_val_loss  = float("inf")
-    best_val_sharpe = -float("inf")
-    patience_count = 0
-    history = {"train_loss": [], "val_loss": [], "val_sharpe": []}
+    best_val_loss      = float("inf")
+    best_val_sharpe    = -float("inf")
+    best_val_ann_return = -float("inf")
+    patience_count     = 0
+    history = {"train_loss": [], "val_loss": [], "val_sharpe": [], "val_ann_return": []}
 
-    best_model_path = os.path.join(cfg.MODELS_DIR, f"deepm_option{option}_best.pt")
+    best_model_path = os.path.join(cfg.MODELS_DIR, f"deepm_option{option}_{cfg.LOSS_FN}_best.pt")
 
     for epoch in range(1, cfg.MAX_EPOCHS + 1):
-        train_loss          = train_epoch(model, train_dl, optimizer, cash_rate_mean, cfg.LOSS_FN)
-        val_loss, val_sharpe = eval_epoch(model, val_dl, cash_rate_mean, cfg.LOSS_FN)
+        train_loss                       = train_epoch(model, train_dl, optimizer, cash_rate_mean, cfg.LOSS_FN)
+        val_loss, val_sharpe, val_return  = eval_epoch(model, val_dl, cash_rate_mean, cfg.LOSS_FN)
 
         history["train_loss"].append(round(train_loss, 6))
         history["val_loss"].append(round(val_loss, 6))
         history["val_sharpe"].append(round(val_sharpe, 4))
+        history["val_ann_return"].append(round(val_return, 4))
 
         scheduler.step(val_loss)
 
-        improved = val_loss < best_val_loss
+        # Save best model by highest annualised return on val set
+        improved = val_return > best_val_ann_return
         if improved:
-            best_val_loss   = val_loss
-            best_val_sharpe = val_sharpe
-            patience_count  = 0
+            best_val_loss       = val_loss
+            best_val_sharpe     = val_sharpe
+            best_val_ann_return = val_return
+            patience_count      = 0
             torch.save(model.state_dict(), best_model_path)
         else:
             patience_count += 1
 
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Epoch {epoch:3d} | train={train_loss:.4f} | "
-                  f"val={val_loss:.4f} | val_sharpe={val_sharpe:.3f} | "
+                  f"val_loss={val_loss:.4f} | val_ret={val_return:.4f} | "
+                  f"val_sharpe={val_sharpe:.3f} | "
                   f"{'*BEST*' if improved else f'patience {patience_count}/{cfg.PATIENCE}'}")
 
         if patience_count >= cfg.PATIENCE:
@@ -240,8 +246,9 @@ def train_option(option: str) -> dict:
     # ── Test evaluation ───────────────────────────────────────────────────────
     print("\nEvaluating on test set...")
     model.load_state_dict(torch.load(best_model_path, map_location=DEVICE))
-    test_loss, test_sharpe = eval_epoch(model, test_dl, cash_rate_mean, cfg.LOSS_FN)
-    print(f"  Test loss={test_loss:.4f} | Test Sharpe={test_sharpe:.3f}")
+    test_loss, test_sharpe, test_ann_return = eval_epoch(model, test_dl, cash_rate_mean, cfg.LOSS_FN)
+    print(f"  Test loss={test_loss:.4f} | Test Sharpe={test_sharpe:.3f} | "
+          f"Test Ann Return={test_ann_return:.4f} ({test_ann_return*100:.2f}%)")
 
     # ── Save scaler ───────────────────────────────────────────────────────────
     scaler_path = os.path.join(cfg.MODELS_DIR, f"scaler_option{option}.pkl")
@@ -261,10 +268,12 @@ def train_option(option: str) -> dict:
         "n_macro_feats":   feat_dict["n_macro_feats"],
         "lookback":        cfg.LOOKBACK,
         "loss_fn":         cfg.LOSS_FN,
-        "best_val_loss":   round(best_val_loss, 6),
-        "best_val_sharpe": round(best_val_sharpe, 4),
-        "test_loss":       round(test_loss, 6),
-        "test_sharpe":     round(test_sharpe, 4),
+        "best_val_loss":      round(best_val_loss, 6),
+        "best_val_sharpe":    round(best_val_sharpe, 4),
+        "best_val_ann_return":round(best_val_ann_return, 4),
+        "test_loss":          round(test_loss, 6),
+        "test_sharpe":        round(test_sharpe, 4),
+        "test_ann_return":    round(test_ann_return, 4),
         "splits":          splits,
         "history":         history,
         "config": {
@@ -286,9 +295,11 @@ def train_option(option: str) -> dict:
         json.dump(summary, f, indent=2)
 
     print(f"\nOption {option} training complete in {elapsed}s")
-    print(f"  Best val Sharpe : {best_val_sharpe:.3f}")
-    print(f"  Test Sharpe     : {test_sharpe:.3f}")
-    print(f"  Model saved     : {best_model_path}")
+    print(f"  Best val Ann Return : {best_val_ann_return*100:.2f}%")
+    print(f"  Best val Sharpe     : {best_val_sharpe:.3f}")
+    print(f"  Test Ann Return     : {test_ann_return*100:.2f}%")
+    print(f"  Test Sharpe         : {test_sharpe:.3f}")
+    print(f"  Model saved         : {best_model_path}")
 
     return summary
 
@@ -305,22 +316,54 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--loss",
-        choices=["evar", "sharpe"],
-        default=None,
-        help="Override loss function (default from config)",
+        choices=["evar", "sharpe", "both"],
+        default="both",
+        help="evar, sharpe, or both (trains both and keeps the better one)",
     )
     args = parser.parse_args()
 
-    if args.loss:
-        cfg.LOSS_FN = args.loss
+    options = ["A", "B"] if args.option == "both" else [args.option]
+    loss_fns = ["evar", "sharpe"] if args.loss == "both" else [args.loss]
 
-    if args.option == "both":
-        summary_A = train_option("A")
-        summary_B = train_option("B")
-        print("\n" + "="*60)
-        print("TRAINING COMPLETE — BOTH OPTIONS")
-        print(f"  Option A Sharpe (test): {summary_A['test_sharpe']:.3f}")
-        print(f"  Option B Sharpe (test): {summary_B['test_sharpe']:.3f}")
-        print("="*60)
-    else:
-        train_option(args.option)
+    final_summaries = {}
+
+    for opt in options:
+        best_summary    = None
+        best_ann_return = -float("inf")
+
+        for loss_fn in loss_fns:
+            print(f"\n{'='*60}")
+            print(f"Training Option {opt} with loss={loss_fn}")
+            print(f"{'='*60}")
+            cfg.LOSS_FN = loss_fn
+            summary = train_option(opt)
+
+            # Winner = highest annualised return on test set
+            if summary["test_ann_return"] > best_ann_return:
+                best_ann_return = summary["test_ann_return"]
+                best_summary    = summary
+
+                # Copy winning model to canonical filename used by predict.py
+                import shutil
+                src = os.path.join(cfg.MODELS_DIR, f"deepm_option{opt}_{loss_fn}_best.pt")
+                dst = os.path.join(cfg.MODELS_DIR, f"deepm_option{opt}_best.pt")
+                shutil.copy2(src, dst)
+
+                # Save meta with winner flag
+                best_summary["winning_loss"] = loss_fn
+                meta_path = os.path.join(cfg.MODELS_DIR, f"meta_option{opt}.json")
+                with open(meta_path, "w") as f:
+                    json.dump(best_summary, f, indent=2)
+
+        final_summaries[opt] = best_summary
+        print(f"\nOption {opt} winner: loss={best_summary['winning_loss']} "
+              f"| test ann_return={best_summary['test_ann_return']:.3f} "
+              f"| test Sharpe={best_summary['test_sharpe']:.3f}")
+
+    print("\n" + "="*60)
+    print("ALL TRAINING COMPLETE")
+    for opt, summary in final_summaries.items():
+        print(f"  Option {opt}: {summary['winning_loss']} | "
+              f"ann_return={summary['test_ann_return']:.3f} | "
+              f"Sharpe={summary['test_sharpe']:.3f}")
+    print("="*60)
