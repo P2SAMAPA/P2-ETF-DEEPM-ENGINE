@@ -164,6 +164,7 @@ def build_labels(
     cash_rate: pd.Series,
     vix: pd.Series = None,
     vix_cash_threshold: float = 25.0,
+    include_cash: bool = True,
 ) -> tuple:
     """
     Build classification labels for the ETF classifier head.
@@ -181,8 +182,8 @@ def build_labels(
     ret_cols = [t for t in tickers if t in returns.columns]
     ret = returns[ret_cols].copy()
 
-    label_names = ret_cols + [cfg.FI_CASH if cfg.FI_CASH else "CASH"]
-    n_cash = len(label_names) - 1
+    label_names = ret_cols + ["CASH"] if include_cash else ret_cols
+    n_cash      = len(ret_cols)  # index of CASH if included
 
     labels = pd.Series(index=ret.index, dtype=int, name="label")
     excess_ret = ret.subtract(cash_rate.reindex(ret.index).fillna(0.0), axis=0)
@@ -266,10 +267,12 @@ def prepare_features(data: dict, lookback: int = None) -> dict:
     # Macro features
     macro_feat = build_macro_features(data["macro"], data["macro_derived"])
 
-    # Labels
+    # Labels — CASH only valid for FI (Option A), not Equity (Option B)
+    include_cash = (data["option"] == "A")
     vix = data["macro"]["VIX"] if "VIX" in data["macro"].columns else None
     labels, label_names, excess_ret = build_labels(
-        data["returns"], data["tickers"], data["cash_rate"], vix=vix
+        data["returns"], data["tickers"], data["cash_rate"],
+        vix=vix, include_cash=include_cash,
     )
 
     # Next-day returns (target for EVaR loss)
