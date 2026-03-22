@@ -197,9 +197,10 @@ def best_signal(sig_fixed: dict, sig_window: dict) -> tuple:
     """
     Return (best_signal, source_label) where best = higher OOS ann return.
     Fixed split uses test_ann_return; shrinking window uses oos_ann_return.
+    If conviction is very low (<20%) on both, flags it.
     """
-    ret_fixed  = sig_fixed.get("test_ann_return", -999) if sig_fixed else -999
-    ret_window = sig_window.get("oos_ann_return",  -999) if sig_window else -999
+    ret_fixed  = sig_fixed.get("test_ann_return",  -999) if sig_fixed else -999
+    ret_window = sig_window.get("oos_ann_return",   -999) if sig_window else -999
 
     if ret_window > ret_fixed and sig_window and "pick" in sig_window:
         return sig_window, "Shrinking Window"
@@ -207,6 +208,18 @@ def best_signal(sig_fixed: dict, sig_window: dict) -> tuple:
         return sig_fixed, "Fixed Split"
     else:
         return sig_fixed or sig_window or {}, "—"
+
+
+def conviction_warning(signal: dict) -> str:
+    """Return warning text if model conviction is low (weights nearly flat)."""
+    if not signal or "weights" not in signal:
+        return ""
+    weights  = signal.get("weights", {})
+    max_w    = max(weights.values()) if weights else 0
+    if max_w < 0.20:
+        return (f"⚠️ Low conviction ({max_w*100:.1f}%) — weights are nearly flat. "
+                f"Model is uncertain about direction.")
+    return ""
 
 
 # ── UI helpers ─────────────────────────────────────────────────────────────────
@@ -254,6 +267,9 @@ def render_hero(sig_fixed: dict, sig_window: dict, option: str):
     if rc.get("HY_SPREAD"):        pills += pill("HY Spr", rc["HY_SPREAD"], 300, 500)
     if st_ is not None:            pills += pill("Stress",  st_,          -0.5, 0.5)
 
+    warn = conviction_warning(best)
+    warn_html = f"<div style='margin-top:10px;font-size:14px;color:#92400e;background:#fef3c7;padding:8px 14px;border-radius:8px;'>{warn}</div>" if warn else ""
+
     st.markdown(f"""
     <div class="hero-card">
       <div class="hero-ticker">{t1[0]}</div>
@@ -262,6 +278,7 @@ def render_hero(sig_fixed: dict, sig_window: dict, option: str):
       <div class="hero-source">Source: {source}</div>
       <div class="runner-up">{runner}</div>
       <div style="margin-top:16px">{pills}</div>
+      {warn_html}
     </div>
     """, unsafe_allow_html=True)
 
@@ -357,20 +374,29 @@ def render_footnote(signal: dict, window: bool = False):
     )
 
 
-def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
+def render_history(hist_df: pd.DataFrame, master: pd.DataFrame, best_sig: dict = None):
     if hist_df.empty:
         st.info("Signal history will appear after the first training run.")
         return
+
+    # Override today's pick in history with the best signal's pick
+    if best_sig and "pick" in best_sig and "signal_date" in best_sig:
+        best_date = best_sig["signal_date"]
+        best_pick = best_sig["pick"]
+        best_conv = best_sig["conviction"]
+        # Update matching row or append
+        mask = hist_df["signal_date"] == best_date
+        if mask.any():
+            hist_df.loc[mask, "pick"]       = best_pick
+            hist_df.loc[mask, "conviction"] = best_conv
+        # If not found, history already has it from predict.py
 
     if "actual_return" not in hist_df.columns and not master.empty:
         def get_ret(row):
             try:
                 date = pd.Timestamp(row["signal_date"])
                 pick = row["pick"]
-                if pick == "CASH":
-                    col = "TBILL_daily"
-                else:
-                    col = f"{pick}_ret"
+                col  = "TBILL_daily" if pick == "CASH" else f"{pick}_ret"
                 if col in master.columns and date in master.index:
                     return master.loc[date, col]
             except Exception:
@@ -433,9 +459,20 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
     bt_f = build_bt(sig,  master, option)
     bt_w = build_bt(sigw, master, option)
 
+    # OOS period label for fixed split
+    oos_start = cfg.LIVE_START
+    oos_end   = str(master.index[-1].date()) if not master.empty else "today"
+
     with col_f:
         st.markdown("<div class='label-fixed'>Fixed Split (70/15/15)</div>",
                     unsafe_allow_html=True)
+        # Matching badge for alignment with shrinking window panel
+        st.markdown(
+            f"<div class='window-badge' style='background:#f3f4f6;border-color:#e5e7eb;color:#374151;'>"
+            f"OOS: {oos_start} → {oos_end}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
         render_metrics(bt_f)
         render_curve(bt_f)
         render_footnote(sig, window=False)
@@ -451,13 +488,22 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
                 f"</div>",
                 unsafe_allow_html=True,
             )
+        else:
+            # Empty badge to keep alignment
+            st.markdown(
+                "<div class='window-badge' style='visibility:hidden;'>placeholder</div>",
+                unsafe_allow_html=True,
+            )
         render_metrics(bt_w)
         render_curve(bt_w)
         render_footnote(sigw, window=True)
 
     # Signal history — full width
+    # Use best signal pick for history display
+    best, source = best_signal(sig, sigw)
     st.markdown("<div class='sec-hdr'>Signal History</div>", unsafe_allow_html=True)
-    render_history(hist, master)
+    st.caption(f"Pick shown is from: {source}")
+    render_history(hist, master, best)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
