@@ -9,10 +9,6 @@ on:
         description: "Option to train (A, B, or both)"
         required: false
         default: "both"
-      loss_fn:
-        description: "Loss function (evar or sharpe)"
-        required: false
-        default: "evar"
 
 jobs:
   train-predict:
@@ -32,15 +28,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Train DeePM models
+      - name: Train DeePM (evar + sharpe, auto-select best per option)
         env:
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
           FRED_API_KEY:    ${{ secrets.FRED_API_KEY }}
           HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
         run: |
           OPTION="${{ github.event.inputs.option || 'both' }}"
-          LOSS="${{ github.event.inputs.loss_fn || 'evar' }}"
-          python train.py --option $OPTION --loss $LOSS
+          python train.py --option $OPTION --loss both
 
       - name: Generate daily signals
         env:
