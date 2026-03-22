@@ -1,7 +1,7 @@
 # app.py — P2-ETF-DEEPM-ENGINE Streamlit Dashboard
 # Tab layout: Option A | Option B
 # Hero shows BEST signal across fixed split and shrinking window
-# Backtest correctly handles CASH as a valid pick
+
 
 import json
 from datetime import datetime
@@ -137,9 +137,9 @@ def build_bt(signal: dict, master: pd.DataFrame, option: str) -> dict:
     if not signal or "weights" not in signal or master.empty:
         return {}
 
-    tickers   = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
-    benchmark = cfg.FI_BENCHMARK if option == "A" else cfg.EQ_BENCHMARK
-    label_names = tickers + ["CASH"]
+    tickers     = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
+    benchmark   = cfg.FI_BENCHMARK if option == "A" else cfg.EQ_BENCHMARK
+    label_names = tickers  # no CASH — model always picks an ETF
 
     oos = master[master.index >= cfg.LIVE_START].copy()
     if oos.empty:
@@ -237,7 +237,7 @@ def render_hero(sig_fixed: dict, sig_window: dict, option: str):
         return
 
     tickers     = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
-    label_names = tickers + ["CASH"]
+    label_names = tickers  # no CASH
     w           = best.get("weights", {})
     picks       = sorted(
         [(t, w.get(t, 0.0)) for t in label_names],
