@@ -3,7 +3,7 @@ name: Daily Dataset Update
 on:
   schedule:
     - cron: "0 22 * * 1-5"   # 22:00 UTC Mon-Fri (after US market close)
-  workflow_dispatch:          # allow manual trigger anytime
+  workflow_dispatch:          # manual trigger anytime
 
 jobs:
   update:
@@ -11,24 +11,29 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run daily update
+      - name: Incremental data update
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+        run: python data_download.py --mode incremental
+
+      - name: Push updated data to HuggingFace
         env:
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
-          FRED_API_KEY:    ${{ secrets.FRED_API_KEY }}
-          HF_DATASET_REPO: "P2SAMAPA/p2-etf-deepm-data"
-        run: python update_daily.py
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+        run: python data_upload_hf.py --meta
 
-      - name: Notify on failure
-        if: failure()
-        run: echo "Daily update failed — check logs above"
+      - name: Confirm update
+        run: echo "Daily update complete."
