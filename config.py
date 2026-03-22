@@ -103,7 +103,7 @@ DROPOUT             = 0.2
 TRAIN_SPLIT         = 0.70   # 70% train
 VAL_SPLIT           = 0.15   # 15% val (remaining 15% = test)
 BATCH_SIZE          = 64
-MAX_EPOCHS          = 100
+MAX_EPOCHS          = 150
 PATIENCE            = 15     # early stopping patience
 LEARNING_RATE       = 1e-3
 WEIGHT_DECAY        = 1e-4
