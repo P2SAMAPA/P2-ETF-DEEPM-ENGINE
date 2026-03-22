@@ -183,7 +183,7 @@ def train_option(option: str) -> dict:
 
     # ── Model ─────────────────────────────────────────────────────────────────
     print("\n[4/5] Building model...")
-    include_cash = (option == "A")
+    include_cash = False  # no CASH for either option
 
     model = DeePM(
         n_assets=feat_dict["n_assets"],
