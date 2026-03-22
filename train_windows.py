@@ -128,7 +128,7 @@ def train_single_window(
     cash_rate_mean = float(data["cash_rate"].mean())
 
     # Build model
-    include_cash = (option == "A")
+    include_cash = False  # no CASH for either option
 
     model = DeePM(
         n_assets=feat_dict["n_assets"],
