@@ -267,8 +267,8 @@ def prepare_features(data: dict, lookback: int = None) -> dict:
     # Macro features
     macro_feat = build_macro_features(data["macro"], data["macro_derived"])
 
-    # Labels — CASH only valid for FI (Option A), not Equity (Option B)
-    include_cash = (data["option"] == "A")
+    # No CASH for either option — model always picks an ETF
+    include_cash = False
     vix = data["macro"]["VIX"] if "VIX" in data["macro"].columns else None
     labels, label_names, excess_ret = build_labels(
         data["returns"], data["tickers"], data["cash_rate"],
