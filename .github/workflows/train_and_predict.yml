@@ -26,7 +26,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements_train.txt
 
       - name: Train DeePM (evar + sharpe, auto-select best per option)
         env:
