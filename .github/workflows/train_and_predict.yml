@@ -1,0 +1,59 @@
+name: Daily Train and Predict
+
+on:
+  schedule:
+    - cron: "30 22 * * 1-5"   # 22:30 UTC Mon-Fri (after data update at 22:00)
+  workflow_dispatch:
+    inputs:
+      option:
+        description: "Option to train (A, B, or both)"
+        required: false
+        default: "both"
+      loss_fn:
+        description: "Loss function (evar or sharpe)"
+        required: false
+        default: "evar"
+
+jobs:
+  train-predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180   # 3 hours max for both options
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Train DeePM models
+        env:
+          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
+          FRED_API_KEY:    ${{ secrets.FRED_API_KEY }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+        run: |
+          OPTION="${{ github.event.inputs.option || 'both' }}"
+          LOSS="${{ github.event.inputs.loss_fn || 'evar' }}"
+          python train.py --option $OPTION --loss $LOSS
+
+      - name: Generate daily signals
+        env:
+          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
+          FRED_API_KEY:    ${{ secrets.FRED_API_KEY }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+        run: python predict.py --option both
+
+      - name: Upload models and signals to HuggingFace
+        env:
+          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+        run: python data_upload_hf.py --models
+
+      - name: Confirm completion
+        run: echo "Training and signal generation complete."
