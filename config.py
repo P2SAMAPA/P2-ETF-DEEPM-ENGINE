@@ -31,7 +31,6 @@ FI_ETFS = [
     "MBB",   # Mortgage-Backed Securities
 ]
 FI_BENCHMARK  = "AGG"
-FI_CASH       = "CASH"
 
 # ── Option B — Equity Sectors ──────────────────────────────────────────────────
 EQ_ETFS = [
@@ -49,7 +48,6 @@ EQ_ETFS = [
     "XME",   # Metals & Mining
 ]
 EQ_BENCHMARK  = "SPY"
-EQ_CASH       = "CASH"
 
 # ── All tickers to download (OHLCV) ───────────────────────────────────────────
 ALL_ETFS = sorted(set(FI_ETFS + EQ_ETFS))
