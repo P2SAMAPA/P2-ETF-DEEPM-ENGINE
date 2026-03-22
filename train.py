@@ -134,9 +134,14 @@ def eval_epoch(
 
             total_loss += loss.item()
 
-            n_assets = weights.shape[1] - 1
-            port_ret = (weights[:, :n_assets] * y_batch).sum(dim=1) + \
-                       weights[:, n_assets] * cash_batch
+            n_outputs = weights.shape[1]
+            has_cash  = (n_outputs > y_batch.shape[1])
+            n_assets_ = y_batch.shape[1]
+            w_assets  = weights[:, :n_assets_]
+            w_cash    = weights[:, n_assets_:n_assets_+1] if has_cash else \
+                        torch.zeros(len(y_batch), 1)
+            port_ret  = (w_assets * y_batch).sum(dim=1) + \
+                        w_cash.squeeze(1) * cash_batch
             all_port_rets.extend(port_ret.numpy())
 
     avg_loss   = total_loss / len(loader_)
@@ -178,6 +183,8 @@ def train_option(option: str) -> dict:
 
     # ── Model ─────────────────────────────────────────────────────────────────
     print("\n[4/5] Building model...")
+    include_cash = (option == "A")
+
     model = DeePM(
         n_assets=feat_dict["n_assets"],
         n_asset_feats=feat_dict["n_asset_feats"],
@@ -187,6 +194,7 @@ def train_option(option: str) -> dict:
         graph_hidden_dim=cfg.GRAPH_HIDDEN_DIM,
         n_attn_heads=cfg.N_ATTN_HEADS,
         dropout=cfg.DROPOUT,
+        include_cash=include_cash,
     ).to(DEVICE)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -264,6 +272,7 @@ def train_option(option: str) -> dict:
         "n_params":        n_params,
         "n_assets":        feat_dict["n_assets"],
         "tickers":         feat_dict["tickers"],
+        "include_cash":    include_cash,
         "n_asset_feats":   feat_dict["n_asset_feats"],
         "n_macro_feats":   feat_dict["n_macro_feats"],
         "lookback":        cfg.LOOKBACK,
