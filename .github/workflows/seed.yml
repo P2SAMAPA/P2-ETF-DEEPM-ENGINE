@@ -2,11 +2,6 @@ name: Seed Dataset (run once)
 
 on:
   workflow_dispatch:
-    inputs:
-      push_meta:
-        description: "Also push metadata.json"
-        required: false
-        default: "true"
 
 jobs:
   seed:
@@ -36,12 +31,7 @@ jobs:
         env:
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
           HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
-        run: |
-          if [ "${{ github.event.inputs.push_meta }}" = "true" ]; then
-            python data_upload_hf.py --meta
-          else
-            python data_upload_hf.py
-          fi
+        run: python data_upload_hf.py --meta
 
       - name: Confirm upload
         run: echo "Seed complete. Data uploaded to HuggingFace."
