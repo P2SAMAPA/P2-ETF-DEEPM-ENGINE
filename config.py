@@ -89,6 +89,27 @@ RETURN_WINDOWS      = [1, 5, 21, 63, 126, 252]
 TRAIN_END           = "2024-12-31"
 LIVE_START          = "2025-01-01"
 
+# ── Feature engineering ───────────────────────────────────────────────────────
+LOOKBACK            = 60    # trading days (~3 months) sequence length
+
+# ── Model architecture ────────────────────────────────────────────────────────
+ASSET_HIDDEN_DIM    = 64
+MACRO_HIDDEN_DIM    = 64
+GRAPH_HIDDEN_DIM    = 64
+N_ATTN_HEADS        = 2
+DROPOUT             = 0.2
+
+# ── Training ───────────────────────────────────────────────────────────────────
+TRAIN_SPLIT         = 0.70   # 70% train
+VAL_SPLIT           = 0.15   # 15% val (remaining 15% = test)
+BATCH_SIZE          = 64
+MAX_EPOCHS          = 100
+PATIENCE            = 15     # early stopping patience
+LEARNING_RATE       = 1e-3
+WEIGHT_DECAY        = 1e-4
+LOSS_FN             = "evar" # "evar" or "sharpe"
+EVAR_BETA           = 0.95   # penalise worst 5% of days
+
 # ── Local directories ─────────────────────────────────────────────────────────
 DATA_DIR            = "data"
 MODELS_DIR          = "models"
