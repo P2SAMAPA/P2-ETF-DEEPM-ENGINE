@@ -1,10 +1,9 @@
 # app.py — P2-ETF-DEEPM-ENGINE Streamlit Dashboard
-# Light/white background
-# Layout: Option A (left) | Option B (right)
-# Each option: hero card + fixed split vs shrinking window side by side
+# Tab layout: Option A | Option B
+# Each tab: hero card, then fixed split vs shrinking window side by side,
+# then signal history table full width.
 
 import json
-import os
 from datetime import datetime
 
 import numpy as np
@@ -25,75 +24,53 @@ st.set_page_config(
 st.markdown("""
 <style>
   .stApp { background-color: #ffffff; }
-  section[data-testid="stSidebar"] { background-color: #f8f9fa; }
 
-  /* Hero card */
+  /* Hero */
   .hero-card {
-    background: #f0f4ff;
-    border: 1px solid #d0d8f0;
-    border-radius: 12px;
-    padding: 24px 28px 20px 28px;
-    margin-bottom: 16px;
+    background: #f0f4ff; border: 1px solid #d0d8f0;
+    border-radius: 14px; padding: 28px 32px 22px 32px; margin-bottom: 24px;
   }
-  .hero-ticker  { font-size: 56px; font-weight: 700; color: #1a1a2e; line-height: 1.1; }
-  .hero-conv    { font-size: 26px; font-weight: 500; color: #3a5bd9; margin-top: 4px; }
-  .hero-date    { font-size: 15px; color: #6b7280; margin-top: 8px; }
-  .runner-up    { font-size: 17px; color: #374151; margin-top: 12px;
-                  padding-top: 12px; border-top: 1px solid #e5e7eb; }
+  .hero-ticker { font-size: 64px; font-weight: 700; color: #1a1a2e; line-height: 1.1; }
+  .hero-conv   { font-size: 28px; font-weight: 500; color: #3a5bd9; margin-top: 6px; }
+  .hero-date   { font-size: 15px; color: #6b7280; margin-top: 8px; }
+  .runner-up   { font-size: 18px; color: #374151; margin-top: 14px;
+                 padding-top: 14px; border-top: 1px solid #e5e7eb; }
 
-  /* Section label */
-  .split-label {
-    font-size: 13px; font-weight: 700; color: #374151;
-    text-transform: uppercase; letter-spacing: 0.08em;
-    margin: 4px 0 10px 0; padding: 4px 10px;
-    background: #f3f4f6; border-radius: 6px; display: inline-block;
-  }
-  .window-label {
-    font-size: 13px; font-weight: 700; color: #1d4ed8;
-    text-transform: uppercase; letter-spacing: 0.08em;
-    margin: 4px 0 10px 0; padding: 4px 10px;
-    background: #eff6ff; border-radius: 6px; display: inline-block;
-  }
-  .window-badge {
-    font-size: 13px; color: #1d4ed8;
-    background: #eff6ff; border: 1px solid #bfdbfe;
-    border-radius: 20px; padding: 3px 12px;
-    display: inline-block; margin-bottom: 10px;
-  }
+  /* Method labels */
+  .label-fixed  { display:inline-block; font-size:14px; font-weight:700;
+                  color:#374151; text-transform:uppercase; letter-spacing:.07em;
+                  background:#f3f4f6; border-radius:6px; padding:5px 14px; margin-bottom:12px; }
+  .label-window { display:inline-block; font-size:14px; font-weight:700;
+                  color:#1d4ed8; text-transform:uppercase; letter-spacing:.07em;
+                  background:#eff6ff; border-radius:6px; padding:5px 14px; margin-bottom:12px; }
+  .window-badge { font-size:14px; color:#1d4ed8; background:#eff6ff;
+                  border:1px solid #bfdbfe; border-radius:20px;
+                  padding:4px 14px; display:inline-block; margin-bottom:12px; }
 
-  /* Metric strip */
-  .metric-row { display: flex; gap: 10px; margin: 10px 0; }
-  .metric-box {
-    flex: 1; background: #ffffff; border: 1px solid #e5e7eb;
-    border-radius: 8px; padding: 12px 10px; text-align: center;
-  }
-  .metric-label { font-size: 12px; color: #6b7280; text-transform: uppercase;
-                  letter-spacing: 0.05em; margin-bottom: 4px; }
-  .metric-value { font-size: 22px; font-weight: 600; color: #111827; }
-  .metric-value.pos { color: #059669; }
-  .metric-value.neg { color: #dc2626; }
+  /* Metrics */
+  .metric-row { display:flex; gap:12px; margin:10px 0 16px 0; }
+  .metric-box { flex:1; background:#fff; border:1px solid #e5e7eb;
+                border-radius:10px; padding:14px 10px; text-align:center; }
+  .metric-label { font-size:12px; color:#6b7280; text-transform:uppercase;
+                  letter-spacing:.05em; margin-bottom:6px; }
+  .metric-value { font-size:24px; font-weight:600; color:#111827; }
+  .pos { color:#059669; } .neg { color:#dc2626; }
 
   /* Macro pills */
-  .macro-pill { display: inline-block; padding: 4px 12px; border-radius: 20px;
-                font-size: 14px; font-weight: 500; margin: 3px 3px 3px 0; }
-  .macro-green { background: #d1fae5; color: #065f46; }
-  .macro-amber { background: #fef3c7; color: #92400e; }
-  .macro-red   { background: #fee2e2; color: #991b1b; }
+  .pill { display:inline-block; padding:5px 14px; border-radius:20px;
+          font-size:15px; font-weight:500; margin:3px 3px 3px 0; }
+  .pill-g { background:#d1fae5; color:#065f46; }
+  .pill-a { background:#fef3c7; color:#92400e; }
+  .pill-r { background:#fee2e2; color:#991b1b; }
 
-  /* Section header */
-  .section-hdr {
-    font-size: 14px; font-weight: 600; color: #6b7280;
-    text-transform: uppercase; letter-spacing: 0.07em;
-    margin: 18px 0 8px 0;
-  }
-
-  /* Option header */
-  .option-hdr {
-    font-size: 20px; font-weight: 700; color: #1a1a2e; margin-bottom: 10px;
-  }
+  /* Hit rate line */
+  .hit-line { font-size:16px; color:#374151; margin-bottom:10px; }
 
   /* Footnote */
-  .footnote { font-size: 13px; color: #9ca3af; margin-top: 6px; }
+  .fn { font-size:13px; color:#9ca3af; margin-top:8px; }
+
+  /* Section divider */
+  .sec-hdr { font-size:20px; font-weight:700; color:#1a1a2e; margin:28px 0 12px 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -101,14 +78,11 @@ st.markdown("""
 # ── Data loading ───────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
-def _hf_load_json(filename: str) -> dict:
+def _load_json(filename: str) -> dict:
     try:
         path = hf_hub_download(
-            repo_id=cfg.HF_DATASET_REPO,
-            filename=filename,
-            repo_type="dataset",
-            token=cfg.HF_TOKEN or None,
-            force_download=True,
+            repo_id=cfg.HF_DATASET_REPO, filename=filename,
+            repo_type="dataset", token=cfg.HF_TOKEN or None, force_download=True,
         )
         with open(path) as f:
             return json.load(f)
@@ -120,11 +94,8 @@ def _hf_load_json(filename: str) -> dict:
 def load_master() -> pd.DataFrame:
     try:
         path = hf_hub_download(
-            repo_id=cfg.HF_DATASET_REPO,
-            filename=cfg.FILE_MASTER,
-            repo_type="dataset",
-            token=cfg.HF_TOKEN or None,
-            force_download=True,
+            repo_id=cfg.HF_DATASET_REPO, filename=cfg.FILE_MASTER,
+            repo_type="dataset", token=cfg.HF_TOKEN or None, force_download=True,
         )
         df = pd.read_parquet(path)
         if "Date" in df.columns:
@@ -136,342 +107,300 @@ def load_master() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def load_all_signals() -> dict:
-    raw = _hf_load_json("models/latest_signals.json")
-    return {
-        "A":        raw.get("option_A", {}),
-        "B":        raw.get("option_B", {}),
-        "A_window": raw.get("option_A_window", {}),
-        "B_window": raw.get("option_B_window", {}),
-    }
-
-
-def load_meta(option: str, window: bool = False) -> dict:
-    suffix = "_window" if window else ""
-    return _hf_load_json(f"models/meta_option{option}{suffix}.json")
-
-
-def load_signal_history(option: str) -> pd.DataFrame:
+@st.cache_data(ttl=3600)
+def load_history(option: str) -> pd.DataFrame:
     try:
         path = hf_hub_download(
             repo_id=cfg.HF_DATASET_REPO,
             filename=f"models/signal_history_{option}.json",
-            repo_type="dataset",
-            token=cfg.HF_TOKEN or None,
-            force_download=True,
+            repo_type="dataset", token=cfg.HF_TOKEN or None, force_download=True,
         )
         with open(path) as f:
-            records = json.load(f)
-        return pd.DataFrame(records)
+            return pd.DataFrame(json.load(f))
     except Exception:
         return pd.DataFrame()
 
 
-# ── Backtest helpers ───────────────────────────────────────────────────────────
+def load_signals() -> dict:
+    raw = _load_json("models/latest_signals.json")
+    return {
+        "A":  raw.get("option_A", {}),
+        "B":  raw.get("option_B", {}),
+        "Aw": raw.get("option_A_window", {}),
+        "Bw": raw.get("option_B_window", {}),
+    }
 
-def oos_equity_curve(signal: dict, master: pd.DataFrame, option: str) -> dict:
-    """Build OOS equity curve from signal weights."""
+
+# ── Backtest ───────────────────────────────────────────────────────────────────
+
+def build_bt(signal: dict, master: pd.DataFrame, option: str) -> dict:
     if not signal or "weights" not in signal or master.empty:
         return {}
-
     tickers   = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
     benchmark = cfg.FI_BENCHMARK if option == "A" else cfg.EQ_BENCHMARK
-
     oos = master[master.index >= cfg.LIVE_START].copy()
     if oos.empty:
         return {}
 
     bench_ret = oos.get(f"{benchmark}_ret", pd.Series(0.0, index=oos.index)).fillna(0.0)
-    cash_rate = oos.get("TBILL_daily", pd.Series(0.0, index=oos.index)).fillna(0.0)
+    cash_rate = oos.get("TBILL_daily",       pd.Series(0.0, index=oos.index)).fillna(0.0)
 
-    weights_dict = signal.get("weights", {})
-    sorted_picks = sorted(
-        [(t, weights_dict.get(t, 0.0)) for t in tickers],
-        key=lambda x: x[1], reverse=True,
-    )
-    top_pick  = sorted_picks[0][0]
-    ret_col   = f"{top_pick}_ret"
-    pick_rets = oos[ret_col].fillna(0.0) if ret_col in oos.columns else cash_rate
+    top_pick = max(
+        [(t, signal["weights"].get(t, 0.0)) for t in tickers],
+        key=lambda x: x[1]
+    )[0]
 
-    strat_curve = (1 + pick_rets).cumprod()
-    bench_curve = (1 + bench_ret).cumprod()
+    pick_rets = oos.get(f"{top_pick}_ret", cash_rate).fillna(0.0)
+    sc = (1 + pick_rets).cumprod()
+    bc = (1 + bench_ret).cumprod()
 
-    def ann_ret(r):  return float(r.mean() * 252)
-    def ann_vol(r):  return float(r.std() * np.sqrt(252))
-    def sharpe(r):   return ann_ret(r) / (ann_vol(r) + 1e-8)
-    def max_dd(c):
-        roll_max = c.cummax()
-        return float(((c - roll_max) / roll_max).min())
-    def hit_rate(r): return float((r > 0).mean())
+    def ar(r):  return float(r.mean() * 252)
+    def av(r):  return float(r.std() * np.sqrt(252))
+    def sh(r):  return ar(r) / (av(r) + 1e-8)
+    def dd(c):  return float(((c - c.cummax()) / c.cummax()).min())
+    def hr(r):  return float((r > 0).mean())
 
     return {
-        "dates":       oos.index,
-        "strat_curve": strat_curve,
-        "bench_curve": bench_curve,
-        "top_pick":    top_pick,
-        "benchmark":   benchmark,
-        "metrics": {
-            "ann_return": ann_ret(pick_rets),
-            "ann_vol":    ann_vol(pick_rets),
-            "sharpe":     sharpe(pick_rets),
-            "max_dd":     max_dd(strat_curve),
-            "hit_rate":   hit_rate(pick_rets),
-        },
+        "dates": oos.index, "sc": sc, "bc": bc,
+        "top_pick": top_pick, "benchmark": benchmark,
+        "m": {"ar": ar(pick_rets), "av": av(pick_rets),
+              "sh": sh(pick_rets), "dd": dd(sc), "hr": hr(pick_rets)},
     }
 
 
-# ── UI components ──────────────────────────────────────────────────────────────
+# ── UI helpers ─────────────────────────────────────────────────────────────────
 
-def macro_pill_html(label, value, low, high):
-    cls = "macro-green" if value < low else ("macro-red" if value > high else "macro-amber")
-    return f'<span class="macro-pill {cls}">{label}: {value}</span>'
+def pill(label, val, lo, hi):
+    cls = "pill-g" if val < lo else ("pill-r" if val > hi else "pill-a")
+    return f'<span class="pill {cls}">{label}: {val}</span>'
 
 
-def render_hero(signal: dict, option: str):
-    if not signal or "error" in signal or "pick" not in signal:
+def hero(signal: dict, option: str):
+    if not signal or "pick" not in signal:
         st.info("Signal not available yet — run the training workflow first.")
         return
-
-    weights     = signal.get("weights", {})
     tickers     = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
     label_names = tickers + ["CASH"]
+    w = signal.get("weights", {})
+    picks = sorted([(t, w.get(t, 0.0)) for t in label_names], key=lambda x: x[1], reverse=True)
 
-    sorted_picks = sorted(
-        [(t, weights.get(t, 0.0)) for t in label_names],
-        key=lambda x: x[1], reverse=True,
-    )
-    top1 = sorted_picks[0]
-    top2 = sorted_picks[1] if len(sorted_picks) > 1 else None
-    top3 = sorted_picks[2] if len(sorted_picks) > 2 else None
-
-    signal_date = signal.get("signal_date", "—")
-    generated   = signal.get("generated_at", "")
+    t1, t2, t3 = picks[0], picks[1] if len(picks) > 1 else None, picks[2] if len(picks) > 2 else None
+    sig_date = signal.get("signal_date", "—")
+    gen      = signal.get("generated_at", "")
     try:
-        generated = datetime.fromisoformat(generated).strftime("%Y-%m-%d %H:%M UTC")
+        gen = datetime.fromisoformat(gen).strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         pass
 
-    runner_html = ""
-    if top2:
-        runner_html += f"<span style='color:#6b7280'>2nd:</span> <b>{top2[0]}</b> {top2[1]*100:.1f}%"
-    if top3:
-        runner_html += f"&nbsp;&nbsp;<span style='color:#6b7280'>3rd:</span> <b>{top3[0]}</b> {top3[1]*100:.1f}%"
+    runner = ""
+    if t2: runner += f"<span style='color:#6b7280'>2nd:</span> <b>{t2[0]}</b> {t2[1]*100:.1f}%"
+    if t3: runner += f"&nbsp;&nbsp;<span style='color:#6b7280'>3rd:</span> <b>{t3[0]}</b> {t3[1]*100:.1f}%"
 
-    rc = signal.get("regime_context", {})
-    stress = signal.get("macro_stress")
-    pills  = ""
-    if rc.get("VIX"):        pills += macro_pill_html("VIX", rc["VIX"], 15, 25)
-    if rc.get("T10Y2Y") is not None: pills += macro_pill_html("T10Y2Y", rc["T10Y2Y"], -0.5, 0.5)
-    if rc.get("HY_SPREAD"):  pills += macro_pill_html("HY Spr", rc["HY_SPREAD"], 300, 500)
-    if stress is not None:   pills += macro_pill_html("Stress", stress, -0.5, 0.5)
+    rc  = signal.get("regime_context", {})
+    st_ = signal.get("macro_stress")
+    pills = ""
+    if rc.get("VIX"):        pills += pill("VIX",    rc["VIX"],    15,   25)
+    if rc.get("T10Y2Y") is not None: pills += pill("T10Y2Y", rc["T10Y2Y"], -0.5, 0.5)
+    if rc.get("HY_SPREAD"):  pills += pill("HY Spr", rc["HY_SPREAD"], 300, 500)
+    if st_ is not None:      pills += pill("Stress",  st_,         -0.5, 0.5)
 
     st.markdown(f"""
     <div class="hero-card">
-      <div class="hero-ticker">{top1[0]}</div>
-      <div class="hero-conv">{top1[1]*100:.1f}% conviction</div>
-      <div class="hero-date">Signal for {signal_date} &nbsp;·&nbsp; Generated {generated}</div>
-      <div class="runner-up">{runner_html}</div>
-      <div style="margin-top:14px">{pills}</div>
+      <div class="hero-ticker">{t1[0]}</div>
+      <div class="hero-conv">{t1[1]*100:.1f}% conviction</div>
+      <div class="hero-date">Signal for {sig_date} &nbsp;·&nbsp; Generated {gen}</div>
+      <div class="runner-up">{runner}</div>
+      <div style="margin-top:16px">{pills}</div>
     </div>
     """, unsafe_allow_html=True)
 
 
-def render_metrics(bt: dict):
-    if not bt or "metrics" not in bt:
+def metrics(bt: dict):
+    if not bt:
         st.caption("Metrics available after first training run.")
         return
-    m = bt["metrics"]
-    def fp(v): return f"{v*100:.1f}%"
-    def cls(v): return "pos" if v >= 0 else "neg"
-
+    m  = bt["m"]
+    fp = lambda v: f"{v*100:.1f}%"
+    c  = lambda v: "pos" if v >= 0 else "neg"
     st.markdown(f"""
     <div class="metric-row">
       <div class="metric-box">
         <div class="metric-label">Ann Return</div>
-        <div class="metric-value {cls(m['ann_return'])}">{fp(m['ann_return'])}</div>
+        <div class="metric-value {c(m['ar'])}">{fp(m['ar'])}</div>
       </div>
       <div class="metric-box">
         <div class="metric-label">Ann Vol</div>
-        <div class="metric-value">{fp(m['ann_vol'])}</div>
+        <div class="metric-value">{fp(m['av'])}</div>
       </div>
       <div class="metric-box">
         <div class="metric-label">Sharpe</div>
-        <div class="metric-value {cls(m['sharpe'])}">{m['sharpe']:.2f}</div>
+        <div class="metric-value {c(m['sh'])}">{m['sh']:.2f}</div>
       </div>
       <div class="metric-box">
         <div class="metric-label">Max DD (peak→trough)</div>
-        <div class="metric-value neg">{fp(m['max_dd'])}</div>
+        <div class="metric-value neg">{fp(m['dd'])}</div>
       </div>
       <div class="metric-box">
         <div class="metric-label">Hit Rate</div>
-        <div class="metric-value">{fp(m['hit_rate'])}</div>
+        <div class="metric-value">{fp(m['hr'])}</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
 
-def render_curve(bt: dict):
-    if not bt or "strat_curve" not in bt:
+def curve(bt: dict):
+    if not bt:
         return
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=bt["dates"], y=bt["strat_curve"].values,
+        x=bt["dates"], y=bt["sc"].values,
         name=f"DeePM ({bt['top_pick']})",
-        line=dict(color="#3a5bd9", width=2),
+        line=dict(color="#3a5bd9", width=2.5),
     ))
     fig.add_trace(go.Scatter(
-        x=bt["dates"], y=bt["bench_curve"].values,
+        x=bt["dates"], y=bt["bc"].values,
         name=bt["benchmark"],
         line=dict(color="#9ca3af", width=1.5, dash="dot"),
     ))
     fig.update_layout(
-        height=240, margin=dict(l=0, r=0, t=8, b=0),
+        height=300, margin=dict(l=0, r=0, t=8, b=0),
         paper_bgcolor="white", plot_bgcolor="white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="left", x=0, font=dict(size=12)),
-        xaxis=dict(showgrid=True, gridcolor="#f3f4f6", tickfont=dict(size=11)),
-        yaxis=dict(showgrid=True, gridcolor="#f3f4f6", tickfont=dict(size=11),
+                    xanchor="left", x=0, font=dict(size=13)),
+        xaxis=dict(showgrid=True, gridcolor="#f3f4f6", tickfont=dict(size=12)),
+        yaxis=dict(showgrid=True, gridcolor="#f3f4f6", tickfont=dict(size=12),
                    tickformat=".2f"),
         hovermode="x unified",
     )
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
-def render_footnote(signal: dict, meta: dict, window: bool = False):
-    if not signal or not meta or "error" in meta:
+def footnote(signal: dict, window: bool = False):
+    if not signal:
         return
-    trained_at = signal.get("trained_at", "—")
+    trained = signal.get("trained_at", "—")
     try:
-        trained_at = datetime.fromisoformat(trained_at).strftime("%Y-%m-%d %H:%M UTC")
+        trained = datetime.fromisoformat(trained).strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         pass
-
     if window:
-        wstart = signal.get("winning_train_start", "?")
-        wend   = signal.get("winning_train_end", "?")
-        wid    = signal.get("winning_window", "?")
-        loss   = signal.get("winning_loss", "—")
-        ret    = signal.get("oos_ann_return", 0)
-        shr    = signal.get("oos_sharpe", 0)
-        extra  = (f"Window {wid} ({wstart}→{wend}) &nbsp;·&nbsp; "
-                  f"Loss: {loss} &nbsp;·&nbsp; "
+        wid  = signal.get("winning_window", "?")
+        ws   = signal.get("winning_train_start", "?")
+        we   = signal.get("winning_train_end", "?")
+        loss = signal.get("winning_loss", "—")
+        ret  = signal.get("oos_ann_return", 0)
+        shr  = signal.get("oos_sharpe", 0)
+        detail = (f"Window {wid} ({ws}→{we}) &nbsp;·&nbsp; Loss: {loss} &nbsp;·&nbsp; "
                   f"OOS Return: {ret*100:.2f}% &nbsp;·&nbsp; Sharpe: {shr:.3f}")
     else:
         loss = signal.get("winning_loss", "—")
         ret  = signal.get("test_ann_return", 0)
         shr  = signal.get("test_sharpe", 0)
-        extra = (f"Loss: {loss} &nbsp;·&nbsp; "
-                 f"Test Return: {ret*100:.2f}% &nbsp;·&nbsp; Sharpe: {shr:.3f}")
-
+        detail = (f"Loss: {loss} &nbsp;·&nbsp; "
+                  f"Test Return: {ret*100:.2f}% &nbsp;·&nbsp; Sharpe: {shr:.3f}")
     st.markdown(
-        f"<div class='footnote'>Trained {trained_at} &nbsp;·&nbsp; {extra}</div>",
+        f"<div class='fn'>Trained {trained} &nbsp;·&nbsp; {detail}</div>",
         unsafe_allow_html=True,
     )
 
 
-def render_signal_history(history_df: pd.DataFrame, master: pd.DataFrame, option: str):
-    if history_df.empty:
+def history_table(hist_df: pd.DataFrame, master: pd.DataFrame):
+    if hist_df.empty:
         st.info("Signal history will appear after the first training run.")
         return
 
-    if "actual_return" not in history_df.columns and not master.empty:
-        def get_actual(row):
+    if "actual_return" not in hist_df.columns and not master.empty:
+        def get_ret(row):
             try:
                 date    = pd.Timestamp(row["signal_date"])
-                ret_col = f"{row['pick']}_ret"
-                if ret_col in master.columns and date in master.index:
-                    return master.loc[date, ret_col]
+                col     = f"{row['pick']}_ret"
+                if col in master.columns and date in master.index:
+                    return master.loc[date, col]
             except Exception:
                 pass
             return np.nan
-        history_df["actual_return"] = history_df.apply(get_actual, axis=1)
+        hist_df["actual_return"] = hist_df.apply(get_ret, axis=1)
 
-    if "hit" not in history_df.columns and "actual_return" in history_df.columns:
-        history_df["hit"] = history_df["actual_return"].apply(
+    if "hit" not in hist_df.columns and "actual_return" in hist_df.columns:
+        hist_df["hit"] = hist_df["actual_return"].apply(
             lambda x: "✓" if (not np.isnan(x) and x > 0) else ("✗" if not np.isnan(x) else "—")
         )
 
-    display = history_df.sort_values("signal_date", ascending=False).copy()
+    disp = hist_df.sort_values("signal_date", ascending=False).copy()
+    col_map = {"signal_date": "Date", "pick": "Pick",
+               "conviction": "Conviction", "actual_return": "Actual Return", "hit": "Hit"}
+    cols = [c for c in col_map if c in disp.columns]
+    disp = disp[cols].rename(columns=col_map)
 
-    col_map = {
-        "signal_date":   "Date",
-        "pick":          "Pick",
-        "conviction":    "Conviction",
-        "actual_return": "Actual Return",
-        "hit":           "Hit",
-    }
-    cols    = [c for c in col_map if c in display.columns]
-    display = display[cols].rename(columns=col_map)
-
-    if "Conviction" in display.columns:
-        display["Conviction"] = display["Conviction"].apply(lambda x: f"{x*100:.1f}%")
-    if "Actual Return" in display.columns:
-        display["Actual Return"] = display["Actual Return"].apply(
+    if "Conviction"    in disp.columns:
+        disp["Conviction"]    = disp["Conviction"].apply(lambda x: f"{x*100:.1f}%")
+    if "Actual Return" in disp.columns:
+        disp["Actual Return"] = disp["Actual Return"].apply(
             lambda x: f"{x*100:.2f}%" if not np.isnan(x) else "—"
         )
 
-    if "Hit" in display.columns:
-        hits   = (display["Hit"] == "✓").sum()
-        total  = (display["Hit"].isin(["✓", "✗"])).sum()
-        hr     = hits / total if total > 0 else 0.0
+    if "Hit" in disp.columns:
+        hits  = (disp["Hit"] == "✓").sum()
+        total = disp["Hit"].isin(["✓", "✗"]).sum()
+        hr    = hits / total if total > 0 else 0
         st.markdown(
-            f"<div style='font-size:15px;color:#374151;margin-bottom:8px;'>"
-            f"Hit rate: <b>{hr:.1%}</b> &nbsp;({hits}/{total} signals)"
-            f"</div>", unsafe_allow_html=True,
+            f"<div class='hit-line'>Hit rate: <b>{hr:.1%}</b> &nbsp;({hits}/{total} signals)</div>",
+            unsafe_allow_html=True,
         )
 
-    st.dataframe(display, use_container_width=True, hide_index=True,
+    st.dataframe(disp, use_container_width=True, hide_index=True,
                  column_config={
                      "Hit":  st.column_config.TextColumn(width="small"),
                      "Pick": st.column_config.TextColumn(width="small"),
                  })
 
 
-# ── Main app ───────────────────────────────────────────────────────────────────
+# ── Option renderer ────────────────────────────────────────────────────────────
 
 def render_option(option: str, signals: dict, master: pd.DataFrame):
-    """Render one full option column (hero + fixed split | shrinking window + history)."""
-    label = "Option A — Fixed Income / Alts" if option == "A" else "Option B — Equity Sectors"
-    st.markdown(f"<div class='option-hdr'>{label}</div>", unsafe_allow_html=True)
+    sig  = signals.get(option,         {})
+    sigw = signals.get(f"{option}w",   {})
+    hist = load_history(option)
 
-    sig        = signals.get(option, {})
-    sig_window = signals.get(f"{option}_window", {})
-    meta       = load_meta(option)
-    meta_win   = load_meta(option, window=True)
+    # Hero — always full width
+    hero(sig, option)
 
-    # Hero card — use fixed split signal (primary)
-    render_hero(sig, option)
+    # Fixed split | Shrinking window — side by side (each gets half the full page)
+    col_f, col_w = st.columns(2, gap="large")
 
-    # Side by side: fixed split | shrinking window
-    col_fixed, col_win = st.columns(2, gap="medium")
+    bt_f = build_bt(sig,  master, option)
+    bt_w = build_bt(sigw, master, option)
 
-    bt_fixed  = oos_equity_curve(sig,        master, option)
-    bt_window = oos_equity_curve(sig_window, master, option)
+    with col_f:
+        st.markdown("<div class='label-fixed'>Fixed Split (70/15/15)</div>", unsafe_allow_html=True)
+        metrics(bt_f)
+        curve(bt_f)
+        footnote(sig, window=False)
 
-    with col_fixed:
-        st.markdown("<div class='split-label'>Fixed Split (70/15/15)</div>", unsafe_allow_html=True)
-        render_metrics(bt_fixed)
-        render_curve(bt_fixed)
-        render_footnote(sig, meta, window=False)
-
-    with col_win:
-        st.markdown("<div class='window-label'>Shrinking Window</div>", unsafe_allow_html=True)
-        if sig_window and "winning_window" in sig_window:
+    with col_w:
+        st.markdown("<div class='label-window'>Shrinking Window</div>", unsafe_allow_html=True)
+        if sigw and "winning_window" in sigw:
             st.markdown(
                 f"<div class='window-badge'>"
-                f"Window {sig_window['winning_window']}: "
-                f"{sig_window.get('winning_train_start','?')} → {sig_window.get('winning_train_end','?')}"
+                f"Window {sigw['winning_window']}: "
+                f"{sigw.get('winning_train_start','?')} → {sigw.get('winning_train_end','?')}"
                 f"</div>",
                 unsafe_allow_html=True,
             )
-        render_metrics(bt_window)
-        render_curve(bt_window)
-        render_footnote(sig_window, meta_win, window=True)
+        metrics(bt_w)
+        curve(bt_w)
+        footnote(sigw, window=True)
 
+    # Signal history — full width below
+    st.markdown("<div class='sec-hdr'>Signal History</div>", unsafe_allow_html=True)
+    history_table(hist, master)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     st.markdown(
-        "<h2 style='margin-bottom:2px;color:#1a1a2e;font-size:32px;'>"
+        "<h2 style='margin-bottom:2px;color:#1a1a2e;font-size:34px;'>"
         "DeePM — Distributionally Robust ETF Engine</h2>"
         "<p style='color:#6b7280;font-size:16px;margin-top:0;'>"
         "Regime-aware &nbsp;·&nbsp; Macro Graph Prior &nbsp;·&nbsp; EVaR objective</p>",
@@ -479,39 +408,22 @@ def main():
     )
 
     with st.spinner("Loading signals and data..."):
-        signals = load_all_signals()
+        signals = load_signals()
         master  = load_master()
-        hist_A  = load_signal_history("A")
-        hist_B  = load_signal_history("B")
-
-    # Side by side options
-    col_a, col_b = st.columns(2, gap="large")
-
-    with col_a:
-        render_option("A", signals, master)
-
-    with col_b:
-        render_option("B", signals, master)
-
-    # Signal history — full width
-    st.markdown("---")
-    st.markdown(
-        "<div style='font-size:20px;font-weight:700;color:#1a1a2e;margin-bottom:14px;'>"
-        "Signal History</div>",
-        unsafe_allow_html=True,
-    )
 
     tab_a, tab_b = st.tabs([
-        "Option A — Fixed Income / Alts",
-        "Option B — Equity Sectors",
+        "📊  Option A — Fixed Income / Alts",
+        "📈  Option B — Equity Sectors",
     ])
+
     with tab_a:
-        render_signal_history(hist_A, master, "A")
+        render_option("A", signals, master)
+
     with tab_b:
-        render_signal_history(hist_B, master, "B")
+        render_option("B", signals, master)
 
     st.markdown(
-        "<div style='margin-top:32px;padding-top:16px;border-top:1px solid #e5e7eb;"
+        "<div style='margin-top:40px;padding-top:16px;border-top:1px solid #e5e7eb;"
         "font-size:13px;color:#9ca3af;text-align:center;'>"
         "P2-ETF-DEEPM-ENGINE &nbsp;·&nbsp; Research only &nbsp;·&nbsp; Not financial advice"
         "</div>",
