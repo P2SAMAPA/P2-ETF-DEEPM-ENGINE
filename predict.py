@@ -184,7 +184,37 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     return signal
 
 
-def save_signals(signal_A: dict = None, signal_B: dict = None) -> None:
+def update_signal_history(signal: dict, option: str) -> None:
+    """
+    Append today's signal to the running history file.
+    History is used by the app for the signal history table.
+    """
+    history_path = os.path.join(cfg.MODELS_DIR, f"signal_history_{option}.json")
+
+    # Load existing history
+    if os.path.exists(history_path):
+        with open(history_path) as f:
+            history = json.load(f)
+    else:
+        history = []
+
+    # Append new record
+    record = {
+        "signal_date": signal["signal_date"],
+        "pick":        signal["pick"],
+        "conviction":  signal["conviction"],
+        "generated_at": signal["generated_at"],
+    }
+
+    # Avoid duplicates for same signal_date
+    existing_dates = {r["signal_date"] for r in history}
+    if record["signal_date"] not in existing_dates:
+        history.append(record)
+
+    # Save updated history
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"[predict] Signal history updated: {len(history)} records for Option {option}")
     """Save signals to models/ directory for upload."""
     os.makedirs(cfg.MODELS_DIR, exist_ok=True)
 
@@ -199,12 +229,16 @@ def save_signals(signal_A: dict = None, signal_B: dict = None) -> None:
         json.dump(combined, f, indent=2)
     print(f"\n[predict] Signals saved to {path}")
 
-    # Also save individually for easy access
-    for sig, name in [(signal_A, "signal_A"), (signal_B, "signal_B")]:
+    # Also save individually for easy access + update history
+    for sig, name, option in [
+        (signal_A, "signal_A", "A"),
+        (signal_B, "signal_B", "B"),
+    ]:
         if sig:
             p = os.path.join(cfg.MODELS_DIR, f"{name}.json")
             with open(p, "w") as f:
                 json.dump(sig, f, indent=2)
+            update_signal_history(sig, option)
 
 
 if __name__ == "__main__":
