@@ -118,6 +118,7 @@ def load_model(option: str) -> tuple:
         graph_hidden_dim=meta["config"]["graph_hidden_dim"],
         n_attn_heads=meta["config"]["n_attn_heads"],
         dropout=0.0,
+        include_cash=meta.get("include_cash", True),
     ).to(DEVICE)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
@@ -129,7 +130,7 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     model, meta, scaler = load_model(option)
     lookback    = meta["lookback"]
     tickers     = meta["tickers"]
-    label_names = tickers + ["CASH"]
+    label_names = tickers if option == "B" else tickers + ["CASH"]
 
     X_asset, X_macro, last_data_date, regime_context, stress = \
         _build_inference_tensors(option, master, lookback, tickers)
@@ -182,6 +183,7 @@ def load_window_model(option: str) -> tuple:
         graph_hidden_dim=meta["config"]["graph_hidden_dim"],
         n_attn_heads=cfg.N_ATTN_HEADS,
         dropout=0.0,
+        include_cash=meta.get("include_cash", True),
     ).to(DEVICE)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
@@ -198,7 +200,7 @@ def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
 
     lookback    = meta["config"]["lookback"]
     tickers     = meta["tickers"]
-    label_names = tickers + ["CASH"]
+    label_names = tickers if option == "B" else tickers + ["CASH"]
 
     X_asset, X_macro, last_data_date, regime_context, stress = \
         _build_inference_tensors(option, master, lookback, tickers)
@@ -273,7 +275,7 @@ def save_signals(
         json.dump(combined, f, indent=2)
     print(f"\n[predict] All signals saved.")
 
-    for sig, name, option, update_hist in [
+    for sig, name, opt, update_hist in [
         (signal_A,        "signal_A",        "A", True),
         (signal_B,        "signal_B",        "B", True),
         (signal_A_window, "signal_A_window", "A", False),
@@ -283,7 +285,7 @@ def save_signals(
             with open(os.path.join(cfg.MODELS_DIR, f"{name}.json"), "w") as f:
                 json.dump(sig, f, indent=2)
             if update_hist:
-                update_signal_history(sig, option)
+                update_signal_history(sig, opt)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
