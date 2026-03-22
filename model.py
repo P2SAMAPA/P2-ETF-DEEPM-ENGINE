@@ -166,13 +166,8 @@ class MacroGraphPrior(nn.Module):
 
 class PortfolioHead(nn.Module):
     """
-    Maps per-asset graph embeddings + macro context to:
-        - Portfolio weights (softmax, long-only, sum to 1) for EVaR loss
-        - ETF selection probabilities (softmax over assets + CASH) for signal
-
-    Input:  asset_graph_emb (batch, n_assets, graph_hidden_dim)
-            macro_ctx       (batch, macro_hidden_dim)
-    Output: weights (batch, n_assets+1)  — includes CASH
+    Maps per-asset graph embeddings + macro context to portfolio weights.
+    n_outputs = n_assets+1 for FI (includes CASH), n_assets for Equity.
     """
 
     def __init__(
@@ -181,10 +176,12 @@ class PortfolioHead(nn.Module):
         graph_hidden_dim: int,
         macro_hidden_dim: int,
         dropout: float = 0.2,
+        n_outputs: int = None,   # defaults to n_assets+1
     ):
         super().__init__()
-        self.n_assets = n_assets
-        combined_dim  = graph_hidden_dim + macro_hidden_dim
+        self.n_assets  = n_assets
+        self.n_outputs = n_outputs if n_outputs is not None else n_assets + 1
+        combined_dim   = graph_hidden_dim + macro_hidden_dim
 
         self.head = nn.Sequential(
             nn.Linear(combined_dim, 128),
@@ -193,7 +190,7 @@ class PortfolioHead(nn.Module):
             nn.Linear(128, 64),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(64, n_assets + 1),   # +1 for CASH
+            nn.Linear(64, self.n_outputs),
         )
 
     def forward(
@@ -236,8 +233,10 @@ class DeePM(nn.Module):
         graph_hidden_dim: int = 64,
         n_attn_heads: int = 2,
         dropout: float = 0.2,
+        include_cash: bool = True,
     ):
         super().__init__()
+        n_outputs = n_assets + 1 if include_cash else n_assets
 
         self.n_assets    = n_assets
         self.asset_encoder  = AssetEncoder(n_asset_feats, asset_hidden_dim)
@@ -247,7 +246,8 @@ class DeePM(nn.Module):
             graph_hidden_dim, n_attn_heads,
         )
         self.portfolio_head = PortfolioHead(
-            n_assets, graph_hidden_dim, macro_hidden_dim, dropout,
+            n_assets, graph_hidden_dim, macro_hidden_dim,
+            dropout, n_outputs=n_outputs,
         )
 
     def forward(
@@ -300,16 +300,18 @@ def evar_loss(
     Returns:
         scalar loss (to minimise)
     """
-    B, n_plus1 = weights.shape
-    n_assets = n_plus1 - 1
+    B, n_outputs = weights.shape
+    # If n_outputs == n_assets: no CASH (equity mode)
+    # If n_outputs == n_assets+1: includes CASH (FI mode)
+    has_cash  = (n_outputs > returns.shape[1])
+    n_assets_ = returns.shape[1]
 
-    # Asset weights + CASH weight
-    w_assets = weights[:, :n_assets]                        # (B, A)
-    w_cash   = weights[:, n_assets:]                        # (B, 1)
+    w_assets = weights[:, :n_assets_]
+    w_cash   = weights[:, n_assets_:n_assets_+1] if has_cash else \
+               torch.zeros(B, 1, dtype=weights.dtype)
 
-    # Portfolio return = weighted sum of asset returns + cash return
     port_ret = (w_assets * returns).sum(dim=1) + \
-               (w_cash.squeeze(1) * cash_rate)              # (B,)
+               (w_cash.squeeze(1) * cash_rate)
 
     # Excess return over cash
     excess = port_ret - cash_rate                           # (B,)
@@ -337,12 +339,14 @@ def sharpe_loss(
     cash_rate: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """
-    Differentiable negative Sharpe ratio loss (fallback / comparison).
-    """
-    n_assets = weights.shape[1] - 1
-    w_assets = weights[:, :n_assets]
-    w_cash   = weights[:, n_assets:]
+    """Differentiable negative Sharpe ratio loss (fallback / comparison)."""
+    B, n_outputs = weights.shape
+    has_cash  = (n_outputs > returns.shape[1])
+    n_assets_ = returns.shape[1]
+
+    w_assets = weights[:, :n_assets_]
+    w_cash   = weights[:, n_assets_:n_assets_+1] if has_cash else \
+               torch.zeros(B, 1, dtype=weights.dtype)
 
     port_ret = (w_assets * returns).sum(dim=1) + w_cash.squeeze(1) * cash_rate
     excess   = port_ret - cash_rate
