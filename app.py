@@ -453,23 +453,34 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
     # Hero — best of fixed split vs shrinking window
     render_hero(sig, sigw, option)
 
+    # Compute fixed split test start date from actual data
+    n_total     = len(master) if not master.empty else 4582
+    n_test      = int(n_total * (1 - cfg.TRAIN_SPLIT - cfg.VAL_SPLIT))
+    test_start  = str(master.index[-n_test].date()) if not master.empty else "~2021"
+    test_end    = str(master.index[-1].date()) if not master.empty else "today"
+    oos_start   = cfg.LIVE_START
+    oos_end     = test_end
+
     # Side by side performance panels
     col_f, col_w = st.columns(2, gap="large")
 
     bt_f = build_bt(sig,  master, option)
     bt_w = build_bt(sigw, master, option)
 
-    # OOS period label for fixed split
-    oos_start = cfg.LIVE_START
-    oos_end   = str(master.index[-1].date()) if not master.empty else "today"
+    # Compute correct test period for fixed split
+    n_total    = len(master) if not master.empty else 4582
+    n_test     = int(n_total * (1 - cfg.TRAIN_SPLIT - cfg.VAL_SPLIT))
+    test_start = str(master.index[-n_test].date()) if not master.empty else "~2021"
+    test_end   = str(master.index[-1].date()) if not master.empty else "today"
+    oos_start  = cfg.LIVE_START
+    oos_end    = test_end
 
     with col_f:
         st.markdown("<div class='label-fixed'>Fixed Split (70/15/15)</div>",
                     unsafe_allow_html=True)
-        # Matching badge for alignment with shrinking window panel
         st.markdown(
             f"<div class='window-badge' style='background:#f3f4f6;border-color:#e5e7eb;color:#374151;'>"
-            f"OOS: {oos_start} → {oos_end}"
+            f"Test period: {test_start} → {test_end}"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -483,8 +494,8 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
         if sigw and "winning_window" in sigw:
             st.markdown(
                 f"<div class='window-badge'>"
-                f"Window {sigw['winning_window']}: "
-                f"{sigw.get('winning_train_start','?')} → {sigw.get('winning_train_end','?')}"
+                f"Train: {sigw.get('winning_train_start','?')} → {sigw.get('winning_train_end','?')}"
+                f" &nbsp;·&nbsp; OOS: {oos_start} → {oos_end}"
                 f"</div>",
                 unsafe_allow_html=True,
             )
