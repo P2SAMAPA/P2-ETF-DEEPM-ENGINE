@@ -38,13 +38,15 @@ def next_trading_day(from_date: str = None) -> str:
     return str(future[0].date()) if future else str((base + pd.Timedelta(days=1)).date())
 
 
-def load_model(option: str) -> DeePM:
+def load_model(option: str) -> tuple:
     """Load trained DeePM model and metadata."""
     model_path = os.path.join(cfg.MODELS_DIR, f"deepm_option{option}_best.pt")
     meta_path  = os.path.join(cfg.MODELS_DIR, f"meta_option{option}.json")
 
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"No trained model found at {model_path}. Run train.py first.")
+        raise FileNotFoundError(
+            f"No trained model found at {model_path}. Run train.py first."
+        )
 
     with open(meta_path) as f:
         meta = json.load(f)
@@ -74,10 +76,7 @@ def load_scaler(option: str):
 def generate_signal(option: str, master: pd.DataFrame) -> dict:
     """
     Generate next-day signal for one option.
-
-    Returns dict with:
-        option, pick, conviction, weights, regime_context,
-        signal_date, trained_at, test_sharpe
+    Returns dict with pick, conviction, weights, regime context etc.
     """
     print(f"\n[predict] Generating signal for Option {option}...")
 
@@ -101,7 +100,9 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     mf = macro_feat.reindex(common_idx).ffill().fillna(0.0)
 
     if len(af) < lookback:
-        raise ValueError(f"Not enough data for lookback={lookback}. Have {len(af)} days.")
+        raise ValueError(
+            f"Not enough data for lookback={lookback}. Have {len(af)} days."
+        )
 
     # Take last `lookback` rows as the inference window
     af_window = af.iloc[-lookback:].values           # (L, Fa)
@@ -134,27 +135,29 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     weights = weights_t.numpy()[0]                   # (A+1,)
 
     # Pick = argmax weight
-    pick_idx = int(np.argmax(weights))
-    pick     = label_names[pick_idx]
+    pick_idx   = int(np.argmax(weights))
+    pick       = label_names[pick_idx]
     conviction = float(weights[pick_idx])
 
     # Weights dict
-    weights_dict = {label_names[i]: round(float(weights[i]), 4)
-                    for i in range(len(label_names))}
+    weights_dict = {
+        label_names[i]: round(float(weights[i]), 4)
+        for i in range(len(label_names))
+    }
 
     # Regime context from latest macro
     latest_macro = data["macro"].iloc[-1]
     regime_context = {
-        "VIX":      round(float(latest_macro.get("VIX", 0)), 2),
-        "T10Y2Y":   round(float(latest_macro.get("T10Y2Y", 0)), 3),
-        "HY_SPREAD":round(float(latest_macro.get("HY_SPREAD", 0)), 2),
-        "USD_INDEX":round(float(latest_macro.get("USD_INDEX", 0)), 2),
+        "VIX":       round(float(latest_macro.get("VIX", 0)), 2),
+        "T10Y2Y":    round(float(latest_macro.get("T10Y2Y", 0)), 3),
+        "HY_SPREAD": round(float(latest_macro.get("HY_SPREAD", 0)), 2),
+        "USD_INDEX": round(float(latest_macro.get("USD_INDEX", 0)), 2),
     }
 
     # Macro stress composite
-    latest_derived = data["macro_derived"].iloc[-1]
-    stress = round(float(latest_derived.get("macro_stress_composite", 0)), 3) \
-             if "macro_stress_composite" in data["macro_derived"].columns else None
+    stress = None
+    if "macro_stress_composite" in data["macro_derived"].columns:
+        stress = round(float(data["macro_derived"]["macro_stress_composite"].iloc[-1]), 3)
 
     last_data_date = str(af.index[-1].date())
     signal_date    = next_trading_day(last_data_date)
@@ -172,6 +175,8 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
         "macro_stress":   stress,
         "trained_at":     meta["trained_at"],
         "test_sharpe":    meta["test_sharpe"],
+        "test_ann_return":meta.get("test_ann_return", 0),
+        "winning_loss":   meta.get("winning_loss", meta.get("loss_fn", "—")),
         "model_n_params": meta["n_params"],
     }
 
@@ -198,11 +203,11 @@ def update_signal_history(signal: dict, option: str) -> None:
     else:
         history = []
 
-    # Append new record
+    # Build record
     record = {
-        "signal_date": signal["signal_date"],
-        "pick":        signal["pick"],
-        "conviction":  signal["conviction"],
+        "signal_date":  signal["signal_date"],
+        "pick":         signal["pick"],
+        "conviction":   signal["conviction"],
         "generated_at": signal["generated_at"],
     }
 
@@ -214,22 +219,26 @@ def update_signal_history(signal: dict, option: str) -> None:
     # Save updated history
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
+
     print(f"[predict] Signal history updated: {len(history)} records for Option {option}")
-    """Save signals to models/ directory for upload."""
+
+
+def save_signals(signal_A: dict = None, signal_B: dict = None) -> None:
+    """Save signals to models/ directory for upload to HuggingFace."""
     os.makedirs(cfg.MODELS_DIR, exist_ok=True)
 
+    # Combined file
     combined = {
         "generated_at": datetime.utcnow().isoformat(),
         "option_A":     signal_A,
         "option_B":     signal_B,
     }
-
     path = os.path.join(cfg.MODELS_DIR, "latest_signals.json")
     with open(path, "w") as f:
         json.dump(combined, f, indent=2)
     print(f"\n[predict] Signals saved to {path}")
 
-    # Also save individually for easy access + update history
+    # Individual files + history update
     for sig, name, option in [
         (signal_A, "signal_A", "A"),
         (signal_B, "signal_B", "B"),
