@@ -1,9 +1,10 @@
-# data_upload_hf.py — Push local data/ parquet files to HuggingFace dataset
+# data_upload_hf.py — Push local data/ and models/ files to HuggingFace dataset
 # Proven pattern using CommitOperationAdd for reliable batch uploads.
 #
 # Usage:
-#   python data_upload_hf.py          # push data/ parquets only
-#   python data_upload_hf.py --meta   # also write metadata.json
+#   python data_upload_hf.py            # push data/ parquets only
+#   python data_upload_hf.py --meta     # also push metadata.json
+#   python data_upload_hf.py --models   # also push model weights + signals
 
 import argparse
 import glob
@@ -84,12 +85,10 @@ def push_metadata() -> None:
         "files": {},
     }
 
-    # Summarise each parquet
     for name in ["etf_ohlcv", "etf_returns", "etf_vol", "macro_fred", "macro_derived", "master"]:
         path = os.path.join(config.DATA_DIR, f"{name}.parquet")
         if os.path.exists(path):
             df = pd.read_parquet(path)
-            # Get date range from Date column
             if "Date" in df.columns:
                 dates = pd.to_datetime(df["Date"])
                 meta["files"][name] = {
@@ -105,13 +104,11 @@ def push_metadata() -> None:
                     "cols": len(df.columns),
                 }
 
-    # Save locally
     meta_path = os.path.join(config.DATA_DIR, "metadata.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2, default=str)
     print(f"  metadata.json written")
 
-    # Upload
     upload_files(
         [meta_path],
         ["data/metadata.json"],
@@ -119,9 +116,37 @@ def push_metadata() -> None:
     )
 
 
+def push_models() -> None:
+    """Push trained model weights, signals and history from models/ to HF dataset repo."""
+    model_files = (
+        glob.glob(os.path.join(config.MODELS_DIR, "*.pt"))  +
+        glob.glob(os.path.join(config.MODELS_DIR, "*.pkl")) +
+        glob.glob(os.path.join(config.MODELS_DIR, "*.json"))
+    )
+
+    if not model_files:
+        print("No model files found in models/ — run train.py first.")
+        return
+
+    local_paths = model_files
+    repo_paths  = [f"models/{os.path.basename(f)}" for f in model_files]
+
+    print(f"\nPushing {len(model_files)} model file(s) to {DATASET_REPO}...")
+    for lp, rp in zip(local_paths, repo_paths):
+        size_mb = os.path.getsize(lp) / 1024 / 1024
+        print(f"  {os.path.basename(lp)} ({size_mb:.1f} MB) -> {rp}")
+
+    upload_files(
+        local_paths,
+        repo_paths,
+        commit_msg="[auto] Update DeePM model weights and signals",
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Push P2-ETF-DEEPM data to HuggingFace")
-    parser.add_argument("--meta", action="store_true", help="Also push metadata.json")
+    parser.add_argument("--meta",   action="store_true", help="Also push metadata.json")
+    parser.add_argument("--models", action="store_true", help="Also push model weights + signals")
     args = parser.parse_args()
 
     # Ensure repo exists (no-op if already created)
@@ -136,5 +161,8 @@ if __name__ == "__main__":
 
     if args.meta:
         push_metadata()
+
+    if args.models:
+        push_models()
 
     print("\nHF upload complete.")
