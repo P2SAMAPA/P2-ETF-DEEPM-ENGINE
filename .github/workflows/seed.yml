@@ -3,14 +3,10 @@ name: Seed Dataset (run once)
 on:
   workflow_dispatch:
     inputs:
-      start_date:
-        description: "Start date (YYYY-MM-DD)"
+      push_meta:
+        description: "Also push metadata.json"
         required: false
-        default: "2008-01-01"
-      end_date:
-        description: "End date (YYYY-MM-DD, leave blank for today)"
-        required: false
-        default: ""
+        default: "true"
 
 jobs:
   seed:
@@ -18,23 +14,34 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run seed
+      - name: Download full dataset (2008 to today)
         env:
-          HF_TOKEN:       ${{ secrets.HF_TOKEN }}
-          FRED_API_KEY:   ${{ secrets.FRED_API_KEY }}
-          HF_DATASET_REPO: "P2SAMAPA/p2-etf-deepm-data"
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+        run: python data_download.py --mode seed
+
+      - name: Push data to HuggingFace
+        env:
+          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
         run: |
-          python seed.py \
-            --start "${{ github.event.inputs.start_date }}" \
-            ${{ github.event.inputs.end_date != '' && format('--end "{0}"', github.event.inputs.end_date) || '' }}
+          if [ "${{ github.event.inputs.push_meta }}" = "true" ]; then
+            python data_upload_hf.py --meta
+          else
+            python data_upload_hf.py
+          fi
+
+      - name: Confirm upload
+        run: echo "Seed complete. Data uploaded to HuggingFace."
