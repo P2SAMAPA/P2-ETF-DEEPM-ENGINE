@@ -128,6 +128,8 @@ def train_single_window(
     cash_rate_mean = float(data["cash_rate"].mean())
 
     # Build model
+    include_cash = (option == "A")
+
     model = DeePM(
         n_assets=feat_dict["n_assets"],
         n_asset_feats=feat_dict["n_asset_feats"],
@@ -137,6 +139,7 @@ def train_single_window(
         graph_hidden_dim=cfg.GRAPH_HIDDEN_DIM,
         n_attn_heads=cfg.N_ATTN_HEADS,
         dropout=cfg.DROPOUT,
+        include_cash=include_cash,
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(
@@ -254,6 +257,7 @@ def train_windows_option(option: str) -> dict:
         "all_windows":     all_results,
         "n_assets":        feat_dict["n_assets"],
         "tickers":         feat_dict["tickers"],
+        "include_cash":    (option == "A"),
         "n_asset_feats":   feat_dict["n_asset_feats"],
         "n_macro_feats":   feat_dict["n_macro_feats"],
         "config": {
