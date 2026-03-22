@@ -130,7 +130,7 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     model, meta, scaler = load_model(option)
     lookback    = meta["lookback"]
     tickers     = meta["tickers"]
-    label_names = tickers if option == "B" else tickers + ["CASH"]
+    label_names = tickers  # no CASH for either option
 
     X_asset, X_macro, last_data_date, regime_context, stress = \
         _build_inference_tensors(option, master, lookback, tickers)
@@ -200,7 +200,7 @@ def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
 
     lookback    = meta["config"]["lookback"]
     tickers     = meta["tickers"]
-    label_names = tickers if option == "B" else tickers + ["CASH"]
+    label_names = tickers  # no CASH for either option
 
     X_asset, X_macro, last_data_date, regime_context, stress = \
         _build_inference_tensors(option, master, lookback, tickers)
