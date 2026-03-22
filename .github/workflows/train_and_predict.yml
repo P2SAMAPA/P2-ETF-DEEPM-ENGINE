@@ -13,7 +13,7 @@ on:
 jobs:
   train-predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 180   # 3 hours max for both options
+    timeout-minutes: 300   # 5 hours max for both options
 
     steps:
       - name: Checkout repo
@@ -36,6 +36,15 @@ jobs:
         run: |
           OPTION="${{ github.event.inputs.option || 'both' }}"
           python train.py --option $OPTION --loss both
+
+      - name: Train DeePM shrinking windows (auto-select best window)
+        env:
+          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
+          FRED_API_KEY:    ${{ secrets.FRED_API_KEY }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+        run: |
+          OPTION="${{ github.event.inputs.option || 'both' }}"
+          python train_windows.py --option $OPTION
 
       - name: Generate daily signals
         env:
