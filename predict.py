@@ -109,6 +109,11 @@ def load_model(option: str) -> tuple:
     with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
+    # Auto-detect include_cash from saved weights shape
+    state = torch.load(model_path, map_location=DEVICE)
+    out_size     = state["portfolio_head.head.6.weight"].shape[0]
+    include_cash = (out_size == meta["n_assets"] + 1)
+
     model = DeePM(
         n_assets=meta["n_assets"],
         n_asset_feats=meta["n_asset_feats"],
@@ -118,9 +123,9 @@ def load_model(option: str) -> tuple:
         graph_hidden_dim=meta["config"]["graph_hidden_dim"],
         n_attn_heads=meta["config"]["n_attn_heads"],
         dropout=0.0,
-        include_cash=meta.get("include_cash", False),  # use saved value
+        include_cash=include_cash,
     ).to(DEVICE)
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.load_state_dict(state)
     model.eval()
     return model, meta, scaler
 
@@ -174,6 +179,11 @@ def load_window_model(option: str) -> tuple:
     with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
+    # Auto-detect include_cash from saved weights — avoids meta/weights mismatch
+    state = torch.load(model_path, map_location=DEVICE)
+    out_size = state["portfolio_head.head.6.weight"].shape[0]
+    include_cash = (out_size == meta["n_assets"] + 1)
+
     model = DeePM(
         n_assets=meta["n_assets"],
         n_asset_feats=meta["n_asset_feats"],
@@ -183,8 +193,9 @@ def load_window_model(option: str) -> tuple:
         graph_hidden_dim=meta["config"]["graph_hidden_dim"],
         n_attn_heads=cfg.N_ATTN_HEADS,
         dropout=0.0,
-        include_cash=meta.get("include_cash", False),  # use saved value
+        include_cash=include_cash,
     ).to(DEVICE)
+    model.load_state_dict(state)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
     return model, meta, scaler
