@@ -89,6 +89,10 @@ RETURN_WINDOWS      = [1, 5, 21, 63, 126, 252]
 TRAIN_END           = "2024-12-31"
 LIVE_START          = "2025-01-01"
 
+# ── Local directories ─────────────────────────────────────────────────────────
+DATA_DIR            = "data"
+MODELS_DIR          = "models"
+
 # ── GitHub Actions schedule ───────────────────────────────────────────────────
 # Daily update runs at 22:00 UTC Mon-Fri (after US market close)
 CRON_SCHEDULE       = "0 22 * * 1-5"
