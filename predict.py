@@ -118,7 +118,7 @@ def load_model(option: str) -> tuple:
         graph_hidden_dim=meta["config"]["graph_hidden_dim"],
         n_attn_heads=meta["config"]["n_attn_heads"],
         dropout=0.0,
-        include_cash=meta.get("include_cash", True),
+        include_cash=meta.get("include_cash", False),  # use saved value
     ).to(DEVICE)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
@@ -183,7 +183,7 @@ def load_window_model(option: str) -> tuple:
         graph_hidden_dim=meta["config"]["graph_hidden_dim"],
         n_attn_heads=cfg.N_ATTN_HEADS,
         dropout=0.0,
-        include_cash=meta.get("include_cash", True),
+        include_cash=meta.get("include_cash", False),  # use saved value
     ).to(DEVICE)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
