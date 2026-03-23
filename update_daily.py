@@ -480,15 +480,37 @@ def build_all(start: str, end: str) -> None:
 
 # ── Incremental update ─────────────────────────────────────────────────────────
 
+def _load_from_hf(filename: str) -> pd.DataFrame:
+    """Load a parquet file directly from HuggingFace dataset repo."""
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download(
+        repo_id=config.HF_DATASET_REPO,
+        filename=f"data/{filename}.parquet",
+        repo_type="dataset",
+        token=config.HF_TOKEN or None,
+        force_download=True,
+    )
+    df = pd.read_parquet(path)
+    if "Date" in df.columns:
+        df = df.set_index("Date")
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    return df.sort_index()
+
+
 def incremental_update() -> None:
     print("\nIncremental update mode...")
 
-    # Load existing OHLCV to find last date
+    # ── Load existing data from HuggingFace (not local) ──────────────────────
+    # GitHub Actions runner has no local files — always load from HF
+    print("Loading existing data from HuggingFace...")
     try:
-        ohlcv_existing = load_parquet("etf_ohlcv")
+        ohlcv_existing = _load_from_hf("etf_ohlcv")
         last_date = ohlcv_existing.index.max()
-    except FileNotFoundError:
-        print("No local data found — running full seed instead.")
+        print(f"Last stored date: {last_date.date()}")
+    except Exception as e:
+        print(f"Could not load from HF ({e}) — running full seed instead.")
         seed()
         return
 
@@ -500,6 +522,7 @@ def incremental_update() -> None:
         return
 
     print(f"Fetching new data: {start} -> {end}")
+    time.sleep(random.uniform(2, 5))  # brief pause before hitting YF
 
     # New OHLCV
     new_ohlcv = fetch_ohlcv(config.ALL_TICKERS, start=start, end=end)
