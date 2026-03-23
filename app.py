@@ -129,19 +129,18 @@ def load_signals() -> dict:
 
 # ── Backtest ───────────────────────────────────────────────────────────────────
 
-def build_bt(signal: dict, master: pd.DataFrame, option: str) -> dict:
-    """
-    Build OOS equity curve from signal.
-    Respects CASH as a valid pick — uses T-bill rate if pick is CASH.
-    """
-    if not signal or "weights" not in signal or master.empty:
+def build_bt(signal: dict, master: pd.DataFrame, option: str,
+             start_date: str = None) -> dict:
+    """Build equity curve from signal pick over the specified period."""
+    if not signal or "pick" not in signal or master.empty:
         return {}
 
     tickers     = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
     benchmark   = cfg.FI_BENCHMARK if option == "A" else cfg.EQ_BENCHMARK
-    label_names = tickers  # no CASH — model always picks an ETF
+    label_names = tickers
 
-    oos = master[master.index >= cfg.LIVE_START].copy()
+    period_start = start_date or cfg.LIVE_START
+    oos = master[master.index >= period_start].copy()
     if oos.empty:
         return {}
 
@@ -468,8 +467,8 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
     # Side by side performance panels
     col_f, col_w = st.columns(2, gap="large")
 
-    bt_f = build_bt(sig,  master, option)
-    bt_w = build_bt(sigw, master, option)
+    bt_f = build_bt(sig,  master, option, start_date=test_start)
+    bt_w = build_bt(sigw, master, option, start_date=cfg.LIVE_START)
 
     # Compute correct test period for fixed split
     n_total    = len(master) if not master.empty else 4582
