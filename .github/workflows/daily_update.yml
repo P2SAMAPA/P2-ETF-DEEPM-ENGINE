@@ -25,15 +25,10 @@ jobs:
 
       - name: Incremental data update
         env:
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          HF_TOKEN:     ${{ secrets.HF_TOKEN }}
-        run: python update_daily.py
-
-      - name: Push updated data to HuggingFace
-        env:
+          FRED_API_KEY:    ${{ secrets.FRED_API_KEY }}
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
           HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
-        run: python data_upload_hf.py --meta
+        run: python update_daily.py
 
       - name: Confirm update
         run: echo "Daily update complete."
