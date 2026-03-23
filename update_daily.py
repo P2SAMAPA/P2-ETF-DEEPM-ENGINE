@@ -40,33 +40,41 @@ _session.headers.update({
 
 
 def _yf_download_one(ticker: str, start: str, end: str):
-    """Download one ticker from YF with retry + exponential backoff."""
+    """Download one ticker from YF with retry + exponential backoff.
+    Uses Ticker.history() which is less rate-limited than yf.download()."""
     for attempt in range(4):
         try:
-            df = yf.download(
-                ticker, start=start, end=end,
-                auto_adjust=True, progress=False,
-                threads=False, session=_session,
-            )
-            if not df.empty:
+            t  = yf.Ticker(ticker)
+            df = t.history(start=start, end=end, auto_adjust=True)
+            if df is not None and not df.empty:
+                # Normalize columns
+                df.index = pd.to_datetime(df.index)
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
                 return df
-            raise ValueError("empty")
+            raise ValueError("empty response")
         except Exception as e:
             err = str(e).lower()
             is_rate = any(k in err for k in
                           ["rate limit", "too many", "429", "ratelimit"])
             if is_rate and attempt < 3:
-                wait = 15 * (2 ** attempt) + random.randint(5, 10)
+                wait = 20 * (2 ** attempt) + random.randint(5, 15)
                 print(f"    YF rate-limited {ticker} (attempt {attempt+1}), "
                       f"waiting {wait}s...")
                 time.sleep(wait)
+            elif attempt < 3:
+                wait = 5 + random.randint(1, 5)
+                print(f"    YF error {ticker} (attempt {attempt+1}): {e}, "
+                      f"retrying in {wait}s...")
+                time.sleep(wait)
             else:
+                print(f"    YF gave up on {ticker} after 4 attempts: {e}")
                 return None
     return None
 
 
 def _stooq_download_one(ticker: str, start: str, end: str):
-    """Stooq fallback — Close price only."""
+    """Stooq fallback — returns full OHLCV if available."""
     url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
     for attempt in range(3):
         try:
@@ -74,17 +82,23 @@ def _stooq_download_one(ticker: str, start: str, end: str):
             if df.empty:
                 raise ValueError("empty")
             df = df.sort_index()
-            df = df[(df.index >= start) & (df.index <= end)]
+            df = df[(df.index >= pd.Timestamp(start)) &
+                    (df.index <= pd.Timestamp(end))]
             if df.empty:
-                raise ValueError("no data in range")
-            df.index = pd.to_datetime(df.index).tz_localize(None)
+                raise ValueError("no data in date range")
+            df.index = pd.to_datetime(df.index)
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            print(f"    Stooq OK for {ticker}: {len(df)} rows")
             return df
         except Exception as e:
+            wait = 5 * (2 ** attempt) + random.randint(1, 5)
             if attempt < 2:
-                wait = 5 * (2 ** attempt) + random.randint(1, 5)
                 print(f"    Stooq attempt {attempt+1} failed for {ticker}: "
                       f"{e}. Retrying in {wait}s...")
                 time.sleep(wait)
+            else:
+                print(f"    Stooq gave up on {ticker}: {e}")
     return None
 
 
@@ -112,6 +126,7 @@ def fetch_prices(tickers: list, start: str, end: str) -> pd.DataFrame:
 
         close = df[["Close"]].rename(columns={"Close": ticker})
         frames.append(close)
+        time.sleep(random.uniform(0.5, 1.5))  # avoid rate-limit
 
     if not frames:
         raise RuntimeError("No price data fetched — all tickers failed.")
@@ -161,6 +176,7 @@ def fetch_ohlcv(tickers: list, start: str, end: str) -> pd.DataFrame:
         df = df[keep].copy()
         df.columns = [f"{ticker}_{c}" for c in df.columns]
         frames.append(df)
+        time.sleep(random.uniform(0.5, 1.5))  # avoid rate-limit
 
     if not frames:
         raise RuntimeError("No OHLCV data fetched — all tickers failed.")
