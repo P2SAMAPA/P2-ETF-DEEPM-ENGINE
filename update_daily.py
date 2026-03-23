@@ -88,25 +88,13 @@ def fetch_ohlcv_batch(tickers, start, end):
     """
     log.info(f"Downloading {len(tickers)} tickers individually from {start} to {end}")
 
-    # Optional: set a session with a user agent to mimic a browser
-    session = None
-    try:
-        import requests
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        })
-        yf.set_tz_cache_location(None)  # ignore cache warning
-    except ImportError:
-        pass
-
     frames = []
     failed_tickers = []
 
     for idx, ticker in enumerate(tickers):
         # Random delay between 1 and 3 seconds to mimic human behavior
-        delay = random.uniform(1.0, 3.0)
         if idx > 0:
+            delay = random.uniform(1.0, 3.0)
             log.debug(f"Waiting {delay:.2f}s before {ticker}")
             time.sleep(delay)
 
@@ -114,19 +102,14 @@ def fetch_ohlcv_batch(tickers, start, end):
         success = False
         for attempt in range(3):
             try:
-                # Use session if available
-                kwargs = {
-                    'tickers': ticker,
-                    'start': start,
-                    'end': end,
-                    'auto_adjust': True,
-                    'progress': False,
-                    'threads': False,
-                }
-                if session:
-                    kwargs['session'] = session
-
-                df = yf.download(**kwargs)
+                df = yf.download(
+                    ticker,
+                    start=start,
+                    end=end,
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                )
 
                 if df.empty:
                     log.warning(f"{ticker}: empty data on attempt {attempt+1}")
