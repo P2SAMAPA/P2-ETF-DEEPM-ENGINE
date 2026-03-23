@@ -150,22 +150,24 @@ def build_bt(signal: dict, master: pd.DataFrame, option: str) -> dict:
     cash_rate = oos.get("TBILL_daily",
                         pd.Series(0.0, index=oos.index)).fillna(0.0)
 
-    # Find true top pick including CASH
-    weights_dict = signal.get("weights", {})
-    all_picks = sorted(
-        [(t, weights_dict.get(t, 0.0)) for t in label_names],
-        key=lambda x: x[1], reverse=True,
-    )
-    top_pick = all_picks[0][0]
+    # Use the model's actual pick directly
+    top_pick = signal.get("pick", "")
+    if not top_pick or top_pick not in label_names:
+        # fallback to argmax of weights
+        weights_dict = signal.get("weights", {})
+        all_picks = sorted(
+            [(t, weights_dict.get(t, 0.0)) for t in label_names],
+            key=lambda x: x[1], reverse=True,
+        )
+        top_pick = all_picks[0][0] if all_picks else ""
+
+    if not top_pick:
+        return {}
 
     # Get returns for top pick
-    if top_pick == "CASH":
-        pick_rets  = cash_rate
-        pick_label = "CASH (T-bill)"
-    else:
-        ret_col   = f"{top_pick}_ret"
-        pick_rets = oos.get(ret_col, cash_rate).fillna(0.0)
-        pick_label = top_pick
+    ret_col   = f"{top_pick}_ret"
+    pick_rets = oos.get(ret_col, cash_rate).fillna(0.0)
+    pick_label = top_pick
 
     sc = (1 + pick_rets).cumprod()
     bc = (1 + bench_ret).cumprod()
