@@ -6,6 +6,7 @@ rebuilds master, pushes back to HF.
 """
 import io
 import os
+import time
 import logging
 from datetime import datetime, timedelta
 
@@ -80,19 +81,29 @@ def hf_upload_parquet(df, filename, msg):
 
 
 def fetch_ohlcv_batch(tickers, start, end):
-    """Download ALL tickers in ONE yf.download() call — no rate limiting."""
+    """Download ALL tickers in ONE yf.download() call with retry."""
     log.info(f"Batch downloading {len(tickers)} tickers: {start} to {end}")
-    raw = yf.download(
-        tickers,
-        start=start,
-        end=end,
-        auto_adjust=True,
-        progress=False,
-        group_by="ticker",
-        threads=True,
-    )
-    if raw.empty:
-        log.warning("yf.download returned empty")
+
+    for attempt in range(5):
+        if attempt > 0:
+            wait = 30 * attempt
+            log.info(f"Retrying batch download in {wait}s (attempt {attempt+1}/5)...")
+            time.sleep(wait)
+
+        raw = yf.download(
+            tickers,
+            start=start,
+            end=end,
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+        if not raw.empty:
+            break
+        log.warning(f"Batch attempt {attempt+1} returned empty")
+    else:
+        log.warning("All batch attempts failed")
         return pd.DataFrame()
 
     frames = []
@@ -209,7 +220,8 @@ def main():
 
     new_ohlcv = fetch_ohlcv_batch(ALL_TICKERS, start=start, end=today_str)
     if new_ohlcv.empty:
-        log.warning("No new data — market may be closed.")
+        log.warning("No new OHLCV data after all retries — market closed or YF unavailable.")
+        log.warning("Skipping update. Will retry tomorrow.")
         return
 
     log.info(f"New days: {len(new_ohlcv)} | {list(new_ohlcv.index.date)}")
