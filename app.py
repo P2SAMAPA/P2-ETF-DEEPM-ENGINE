@@ -1,7 +1,7 @@
 # app.py — P2-ETF-DEEPM-ENGINE Streamlit Dashboard
 # Tab layout: Option A | Option B
 # Hero shows BEST signal across fixed split and shrinking window
-
+# Backtest correctly handles CASH as a valid pick
 
 import json
 from datetime import datetime
@@ -316,7 +316,7 @@ def render_metrics(bt: dict):
     """, unsafe_allow_html=True)
 
 
-def render_curve(bt: dict):
+def render_curve(bt: dict, key: str = ""):
     if not bt:
         return
     fig = go.Figure()
@@ -340,7 +340,9 @@ def render_curve(bt: dict):
                    tickformat=".2f"),
         hovermode="x unified",
     )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"curve_{key}")
 
 
 def render_footnote(signal: dict, window: bool = False):
@@ -485,7 +487,7 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
             unsafe_allow_html=True,
         )
         render_metrics(bt_f)
-        render_curve(bt_f)
+        render_curve(bt_f, key=f"{option}_fixed")
         render_footnote(sig, window=False)
 
     with col_w:
@@ -506,7 +508,7 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
                 unsafe_allow_html=True,
             )
         render_metrics(bt_w)
-        render_curve(bt_w)
+        render_curve(bt_w, key=f"{option}_window")
         render_footnote(sigw, window=True)
 
     # Signal history — full width
