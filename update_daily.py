@@ -1,165 +1,546 @@
-# update_daily.py — Incremental daily data update
-# Appends only the latest trading day to all 5 parquet files.
-# Runs via GitHub Actions at 22:00 UTC Mon-Fri.
+# data_download.py — ETF OHLCV + FRED macro downloader
+# Proven pattern: one ticker at a time to avoid yfinance rate limits.
+# Saves all parquet files locally to data/ directory.
+# Then data_upload_hf.py pushes them to HuggingFace.
 #
-# Logic:
-#   1. Load existing parquet files from HF
-#   2. Determine last date already stored
-#   3. If last stored date == last trading day → already up to date, exit
-#   4. Download only the missing days
-#   5. Append and re-upload all 5 files + metadata
+# Usage:
+#   python data_download.py --mode seed         # full history from 2008
+#   python data_download.py --mode incremental  # append latest day only
 
-import logging
-import sys
-from datetime import datetime
+import argparse
+import os
+import warnings
+from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
+import yfinance as yf
+from fredapi import Fred
+from tqdm import tqdm
 
-import config as cfg
-import data_utils as du
+import config
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+warnings.filterwarnings("ignore")
+os.makedirs(config.DATA_DIR, exist_ok=True)
 
 
-def update() -> None:
-    today_str        = datetime.utcnow().strftime("%Y-%m-%d")
-    last_trading_day = du.last_trading_day()
+# ── Price fetching ─────────────────────────────────────────────────────────────
 
-    logger.info("=" * 60)
-    logger.info(f"P2-ETF-DEEPM DAILY UPDATE — {today_str}")
-    logger.info(f"Last NYSE trading day: {last_trading_day}")
-    logger.info("=" * 60)
+import random
+import requests
+import time
 
-    # ── Load existing data ────────────────────────────────────────────────────
-    logger.info("Loading existing parquet files from HuggingFace...")
+# Browser-like session to reduce YF rate limiting
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36"
+})
+
+
+def _yf_download_one(ticker: str, start: str, end: str):
+    """Download one ticker from YF with retry + exponential backoff."""
+    for attempt in range(4):
+        try:
+            df = yf.download(
+                ticker, start=start, end=end,
+                auto_adjust=True, progress=False,
+                threads=False, session=_session,
+            )
+            if not df.empty:
+                return df
+            raise ValueError("empty")
+        except Exception as e:
+            err = str(e).lower()
+            is_rate = any(k in err for k in
+                          ["rate limit", "too many", "429", "ratelimit"])
+            if is_rate and attempt < 3:
+                wait = 15 * (2 ** attempt) + random.randint(5, 10)
+                print(f"    YF rate-limited {ticker} (attempt {attempt+1}), "
+                      f"waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                return None
+    return None
+
+
+def _stooq_download_one(ticker: str, start: str, end: str):
+    """Stooq fallback — Close price only."""
+    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
+    for attempt in range(3):
+        try:
+            df = pd.read_csv(url, parse_dates=["Date"], index_col="Date")
+            if df.empty:
+                raise ValueError("empty")
+            df = df.sort_index()
+            df = df[(df.index >= start) & (df.index <= end)]
+            if df.empty:
+                raise ValueError("no data in range")
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            return df
+        except Exception as e:
+            if attempt < 2:
+                wait = 5 * (2 ** attempt) + random.randint(1, 5)
+                print(f"    Stooq attempt {attempt+1} failed for {ticker}: "
+                      f"{e}. Retrying in {wait}s...")
+                time.sleep(wait)
+    return None
+
+
+def fetch_prices(tickers: list, start: str, end: str) -> pd.DataFrame:
+    """
+    Fetch Close prices one ticker at a time.
+    YF first, Stooq fallback on rate-limit.
+    Returns DataFrame: index=Date, columns=tickers (Close only).
+    """
+    print(f"Fetching prices {start} -> {end} ({len(tickers)} tickers)")
+    frames = []
+
+    for ticker in tqdm(tickers, desc="Prices"):
+        df = _yf_download_one(ticker, start, end)
+
+        if df is None or df.empty:
+            print(f"    YF failed for {ticker} — trying Stooq...")
+            df = _stooq_download_one(ticker, start, end)
+            if df is None:
+                print(f"  WARNING: {ticker} failed on all sources, skipping.")
+                continue
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
+
+        close = df[["Close"]].rename(columns={"Close": ticker})
+        frames.append(close)
+
+    if not frames:
+        raise RuntimeError("No price data fetched — all tickers failed.")
+
+    prices = pd.concat(frames, axis=1)
+    if isinstance(prices.columns, pd.MultiIndex):
+        prices.columns = [col[0] if col[0] != "" else col[1]
+                          for col in prices.columns]
+    prices.columns = [str(c).strip() for c in prices.columns]
+    prices.index = pd.to_datetime(prices.index)
+    if prices.index.tz is not None:
+        prices.index = prices.index.tz_localize(None)
+    prices.index.name = "Date"
+    print(f"  Prices: {prices.shape}, "
+          f"range: {prices.index[0].date()} -> {prices.index[-1].date()}")
+    return prices.sort_index()
+
+
+def fetch_ohlcv(tickers: list, start: str, end: str) -> pd.DataFrame:
+    """
+    Fetch full OHLCV one ticker at a time.
+    YF first, Stooq fallback (Close only — OHLCV filled from Close).
+    Returns flat DataFrame: TLT_Open, TLT_High, TLT_Low, TLT_Close, TLT_Volume, ...
+    """
+    print(f"Fetching OHLCV {start} -> {end} ({len(tickers)} tickers)")
+    frames = []
+
+    for ticker in tqdm(tickers, desc="OHLCV"):
+        df = _yf_download_one(ticker, start, end)
+
+        if df is None or df.empty:
+            print(f"    YF failed for {ticker} — trying Stooq...")
+            df = _stooq_download_one(ticker, start, end)
+            if df is None:
+                print(f"  WARNING: {ticker} failed on all sources, skipping.")
+                continue
+            # Stooq only has OHLCV columns — fill missing with Close
+            for col in ["Open", "High", "Low", "Volume"]:
+                if col not in df.columns:
+                    df[col] = df["Close"]
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
+
+        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"]
+                if c in df.columns]
+        df = df[keep].copy()
+        df.columns = [f"{ticker}_{c}" for c in df.columns]
+        frames.append(df)
+
+    if not frames:
+        raise RuntimeError("No OHLCV data fetched — all tickers failed.")
+
+    ohlcv = pd.concat(frames, axis=1)
+    ohlcv.columns = [str(c).strip() for c in ohlcv.columns]
+    ohlcv.index = pd.to_datetime(ohlcv.index)
+    if ohlcv.index.tz is not None:
+        ohlcv.index = ohlcv.index.tz_localize(None)
+    ohlcv.index.name = "Date"
+    print(f"  OHLCV: {ohlcv.shape}, "
+          f"range: {ohlcv.index[0].date()} -> {ohlcv.index[-1].date()}")
+    return ohlcv.sort_index()
+
+
+# ── Derived: returns & volatility ──────────────────────────────────────────────
+
+def compute_returns_simple(prices: pd.DataFrame) -> pd.DataFrame:
+    """Simple daily returns."""
+    rets = prices.pct_change().dropna(how="all")
+    rets.index.name = "Date"
+    return rets
+
+
+def compute_returns_log(prices: pd.DataFrame) -> pd.DataFrame:
+    """Log daily returns."""
+    rets = np.log(prices / prices.shift(1)).dropna(how="all")
+    rets.index.name = "Date"
+    return rets
+
+
+def compute_volatility(log_returns: pd.DataFrame) -> pd.DataFrame:
+    """Annualised rolling volatility."""
+    vol = log_returns.rolling(config.VOL_WINDOW).std() * np.sqrt(252)
+    vol = vol.dropna(how="all")
+    vol.index.name = "Date"
+    return vol
+
+
+def compute_all_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Combined simple + log returns in one DataFrame.
+    Columns: TLT_ret, TLT_logret, LQD_ret, LQD_logret, ...
+    """
+    simple = compute_returns_simple(prices)
+    log    = compute_returns_log(prices)
+
+    simple.columns = [f"{c}_ret"    for c in simple.columns]
+    log.columns    = [f"{c}_logret" for c in log.columns]
+
+    combined = pd.concat([simple, log], axis=1).sort_index(axis=1)
+    combined.index.name = "Date"
+    return combined.dropna(how="all")
+
+
+# ── FRED macro ─────────────────────────────────────────────────────────────────
+
+def fetch_macro(start: str, end: str) -> pd.DataFrame:
+    """
+    Download all FRED macro series from config.FRED_SERIES.
+    Forward-fills gaps (FRED releases lag by 1 business day).
+    Returns DataFrame indexed by Date, columns = friendly names.
+    """
+    print(f"Fetching FRED macro {start} -> {end}")
+    fred = Fred(api_key=config.FRED_API_KEY)
+    frames = {}
+
+    for name, series_id in tqdm(config.FRED_SERIES.items(), desc="FRED"):
+        try:
+            s = fred.get_series(
+                series_id,
+                observation_start=start,
+                observation_end=end,
+            )
+            s.name = name
+            frames[name] = s
+            print(f"  {name} ({series_id}): {len(s)} obs")
+        except Exception as e:
+            print(f"  WARNING: FRED {name} ({series_id}) failed: {e}")
+
+    if not frames:
+        raise RuntimeError("No FRED series downloaded successfully.")
+
+    macro = pd.DataFrame(frames)
+    macro.index = pd.to_datetime(macro.index)
+    if macro.index.tz is not None:
+        macro.index = macro.index.tz_localize(None)
+    macro.index.name = "Date"
+    macro = macro.sort_index().ffill()
+
+    print(f"  Macro: {macro.shape}")
+    return macro
+
+
+# ── Derived macro features ─────────────────────────────────────────────────────
+
+def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
+    """
+    Engineer macro features from raw FRED series.
+    All rolling z-scores use ZSCORE_WINDOW (63 days ~ 1 quarter).
+    """
+    d = pd.DataFrame(index=macro.index)
+    w = config.ZSCORE_WINDOW
+
+    def zscore(s: pd.Series) -> pd.Series:
+        mu  = s.rolling(w, min_periods=w // 2).mean()
+        sig = s.rolling(w, min_periods=w // 2).std()
+        return (s - mu) / (sig + 1e-8)
+
+    if "VIX" in macro.columns:
+        d["VIX_zscore"]   = zscore(macro["VIX"])
+        d["VIX_log"]      = np.log(macro["VIX"].clip(lower=0.01))
+        d["VIX_chg1d"]    = macro["VIX"].pct_change()
+
+    if "T10Y2Y" in macro.columns:
+        d["YC_slope"]         = macro["T10Y2Y"]
+        d["YC_slope_zscore"]  = zscore(macro["T10Y2Y"])
+        d["YC_slope_chg"]     = macro["T10Y2Y"].diff()
+
+    if "DGS10" in macro.columns:
+        d["DGS10_zscore"] = zscore(macro["DGS10"])
+        d["DGS10_chg"]    = macro["DGS10"].diff()
+
+    if "HY_SPREAD" in macro.columns:
+        d["HY_spread_zscore"] = zscore(macro["HY_SPREAD"])
+        d["HY_spread_chg"]    = macro["HY_SPREAD"].diff()
+
+    if "IG_SPREAD" in macro.columns:
+        d["IG_spread_zscore"] = zscore(macro["IG_SPREAD"])
+
+    if "HY_SPREAD" in macro.columns and "IG_SPREAD" in macro.columns:
+        d["HY_IG_ratio"]        = macro["HY_SPREAD"] / (macro["IG_SPREAD"] + 1e-8)
+        d["HY_IG_ratio_zscore"] = zscore(d["HY_IG_ratio"])
+        d["credit_stress"]      = (zscore(macro["HY_SPREAD"]) + zscore(macro["IG_SPREAD"])) / 2.0
+
+    if "USD_INDEX" in macro.columns:
+        d["USD_zscore"] = zscore(macro["USD_INDEX"])
+        d["USD_chg"]    = macro["USD_INDEX"].pct_change()
+
+    if "WTI_OIL" in macro.columns:
+        d["OIL_zscore"] = zscore(macro["WTI_OIL"])
+        d["OIL_chg"]    = macro["WTI_OIL"].pct_change()
+        d["OIL_log"]    = np.log(macro["WTI_OIL"].clip(lower=0.01))
+
+    if "DTB3" in macro.columns:
+        d["TBILL_daily"] = macro["DTB3"] / 252.0 / 100.0
+
+    if all(c in macro.columns for c in ["VIX", "HY_SPREAD", "T10Y2Y"]):
+        d["macro_stress_composite"] = (
+            zscore(macro["VIX"]) +
+            zscore(macro["HY_SPREAD"]) +
+            (-zscore(macro["T10Y2Y"]))
+        ) / 3.0
+
+    d.index.name = "Date"
+    d = d.dropna(how="all")
+    print(f"  Derived macro: {d.shape}, cols: {list(d.columns)}")
+    return d
+
+
+# ── Save / load ────────────────────────────────────────────────────────────────
+
+def save_parquet(df: pd.DataFrame, name: str) -> None:
+    """
+    Save DataFrame to data/{name}.parquet.
+    Date is saved as a column (not index) — consistent with proven pattern.
+    """
+    path = os.path.join(config.DATA_DIR, f"{name}.parquet")
+    df_save = df.copy()
+
+    # Flatten any MultiIndex columns
+    if isinstance(df_save.columns, pd.MultiIndex):
+        df_save.columns = [
+            col[0] if col[0] != "" else col[1] for col in df_save.columns
+        ]
+    df_save.columns = [str(c).strip() for c in df_save.columns]
+
+    # Reset index so Date becomes a column
+    if df_save.index.name == "Date" or isinstance(df_save.index, pd.DatetimeIndex):
+        df_save = df_save.reset_index()
+
+    if "Date" in df_save.columns:
+        df_save["Date"] = pd.to_datetime(df_save["Date"])
+        if df_save["Date"].dt.tz is not None:
+            df_save["Date"] = df_save["Date"].dt.tz_localize(None)
+
+    df_save.to_parquet(path, index=False, engine="pyarrow")
+    print(f"  Saved {name}.parquet ({len(df_save)} rows, {df_save.shape[1]} cols)")
+
+
+def load_parquet(name: str) -> pd.DataFrame:
+    """
+    Load data/{name}.parquet and restore Date as DatetimeIndex.
+    """
+    path = os.path.join(config.DATA_DIR, f"{name}.parquet")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{path} not found — run seed first.")
+
+    df = pd.read_parquet(path)
+
+    # Restore Date index
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date")
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    df.index.name = "Date"
+
+    # Drop any residual index columns
+    for col in list(df.columns):
+        if isinstance(col, str) and col.lower() in ("date", "index", "level_0"):
+            df = df.drop(columns=[col])
+
+    return df.sort_index()
+
+
+def build_master(
+    ohlcv: pd.DataFrame,
+    returns: pd.DataFrame,
+    macro: pd.DataFrame,
+    macro_derived: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Inner-join all DataFrames on common trading days → master.parquet.
+    No lookahead: FRED is only forward-filled, never backward-filled.
+    """
+    common = (
+        ohlcv.index
+        .intersection(returns.index)
+        .intersection(macro.index)
+        .intersection(macro_derived.index)
+    )
+    common = common.sort_values()
+
+    master = pd.concat(
+        [
+            ohlcv.reindex(common),
+            returns.reindex(common),
+            macro.reindex(common),
+            macro_derived.reindex(common),
+        ],
+        axis=1,
+    )
+    master.index.name = "Date"
+    print(f"  Master: {master.shape}, range: {master.index[0].date()} -> {master.index[-1].date()}")
+    return master
+
+
+# ── Full rebuild ───────────────────────────────────────────────────────────────
+
+def build_all(start: str, end: str) -> None:
+    print(f"\n{'='*60}")
+    print(f"P2-ETF-DEEPM DATASET BUILD: {start} -> {end}")
+    print(f"Tickers : {config.ALL_TICKERS}")
+    print(f"{'='*60}\n")
+
+    # 1. OHLCV
+    print("[1/6] ETF OHLCV...")
+    ohlcv = fetch_ohlcv(config.ALL_TICKERS, start=start, end=end)
+    save_parquet(ohlcv, "etf_ohlcv")
+
+    # 2. Close prices only (for returns)
+    close_cols = [c for c in ohlcv.columns if c.endswith("_Close")]
+    prices = ohlcv[close_cols].copy()
+    prices.columns = [c.replace("_Close", "") for c in prices.columns]
+
+    # 3. Returns
+    print("[2/6] ETF returns...")
+    returns = compute_all_returns(prices)
+    save_parquet(returns, "etf_returns")
+
+    # 4. Volatility (stored separately — some models use it directly)
+    print("[3/6] ETF volatility...")
+    log_rets = compute_returns_log(prices)
+    vol = compute_volatility(log_rets)
+    vol.columns = [f"{c}_vol" for c in vol.columns]
+    save_parquet(vol, "etf_vol")
+
+    # 5. FRED macro
+    print("[4/6] FRED macro...")
+    macro = fetch_macro(start=start, end=end)
+    save_parquet(macro, "macro_fred")
+
+    # 6. Derived macro features
+    print("[5/6] Derived macro features...")
+    macro_derived = compute_macro_derived(macro)
+    save_parquet(macro_derived, "macro_derived")
+
+    # 7. Master aligned file
+    print("[6/6] Master aligned file...")
+    master = build_master(ohlcv, returns, macro, macro_derived)
+    save_parquet(master, "master")
+
+    print(f"\n{'='*60}")
+    print("BUILD COMPLETE")
+    print(f"  Trading days : {len(master)}")
+    print(f"  Master cols  : {master.shape[1]}")
+    print(f"{'='*60}")
+
+
+# ── Incremental update ─────────────────────────────────────────────────────────
+
+def incremental_update() -> None:
+    print("\nIncremental update mode...")
+
+    # Load existing OHLCV to find last date
     try:
-        ohlcv_flat    = du.load_parquet(cfg.FILE_ETF_OHLCV)
-        returns       = du.load_parquet(cfg.FILE_ETF_RETURNS)
-        macro         = du.load_parquet(cfg.FILE_MACRO_FRED)
-        macro_derived = du.load_parquet(cfg.FILE_MACRO_DERIVED)
-    except Exception as e:
-        logger.error(f"Failed to load existing data: {e}")
-        logger.error("Run seed.py first to initialise the dataset.")
-        sys.exit(1)
-
-    last_stored = ohlcv_flat.index[-1].strftime("%Y-%m-%d")
-    logger.info(f"Last stored date : {last_stored}")
-    logger.info(f"Last trading day : {last_trading_day}")
-
-    if last_stored >= last_trading_day:
-        logger.info("Dataset already up to date. Nothing to do.")
+        ohlcv_existing = load_parquet("etf_ohlcv")
+        last_date = ohlcv_existing.index.max()
+    except FileNotFoundError:
+        print("No local data found — running full seed instead.")
+        seed()
         return
 
-    # ── Determine fetch window ─────────────────────────────────────────────────
-    # Fetch from day after last stored to last trading day
-    fetch_start = (pd.Timestamp(last_stored) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    fetch_end   = last_trading_day
-    logger.info(f"Fetching new data: {fetch_start} to {fetch_end}")
+    start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    end   = datetime.today().strftime("%Y-%m-%d")
 
-    # ── 1. New OHLCV ──────────────────────────────────────────────────────────
-    logger.info("Step 1/5 — Downloading new OHLCV...")
-    new_ohlcv_multi = du.download_ohlcv(cfg.ALL_TICKERS, start=fetch_start, end=fetch_end)
-    new_ohlcv_flat  = du.flatten_ohlcv(new_ohlcv_multi)
-
-    if new_ohlcv_flat.empty:
-        logger.warning("No new OHLCV data returned. Market may be closed.")
+    if start >= end:
+        print(f"Already up to date (last: {last_date.date()}). Nothing to do.")
         return
 
-    # Remove any dates already in existing data (safety dedup)
-    new_ohlcv_flat = new_ohlcv_flat[~new_ohlcv_flat.index.isin(ohlcv_flat.index)]
-    if new_ohlcv_flat.empty:
-        logger.info("No new trading days after deduplication. Already up to date.")
+    print(f"Fetching new data: {start} -> {end}")
+
+    # New OHLCV
+    new_ohlcv = fetch_ohlcv(config.ALL_TICKERS, start=start, end=end)
+    if new_ohlcv.empty:
+        print("No new data returned (market closed today?).")
         return
 
-    logger.info(f"New trading days: {len(new_ohlcv_flat)} | {list(new_ohlcv_flat.index.date)}")
+    ohlcv = pd.concat([ohlcv_existing, new_ohlcv])
+    ohlcv = ohlcv[~ohlcv.index.duplicated(keep="last")].sort_index()
+    save_parquet(ohlcv, "etf_ohlcv")
 
-    ohlcv_flat_updated = pd.concat([ohlcv_flat, new_ohlcv_flat]).sort_index()
-    du.upload_parquet(
-        ohlcv_flat_updated,
-        cfg.FILE_ETF_OHLCV,
-        f"[update] ETF OHLCV +{len(new_ohlcv_flat)}d to {fetch_end}"
-    )
+    # Recompute returns + vol on full history
+    close_cols = [c for c in ohlcv.columns if c.endswith("_Close")]
+    prices = ohlcv[close_cols].copy()
+    prices.columns = [c.replace("_Close", "") for c in prices.columns]
 
-    # ── 2. New returns ────────────────────────────────────────────────────────
-    logger.info("Step 2/5 — Computing new returns...")
-    # Need one extra prior day for pct_change continuity
-    prior_close = ohlcv_flat.iloc[[-1]]
-    ohlcv_for_returns = pd.concat([prior_close, new_ohlcv_flat])
-    new_returns = du.compute_returns(ohlcv_for_returns, cfg.ALL_TICKERS)
-    new_returns = new_returns[new_returns.index.isin(new_ohlcv_flat.index)]
+    returns = compute_all_returns(prices)
+    save_parquet(returns, "etf_returns")
 
-    returns_updated = pd.concat([returns, new_returns]).sort_index()
-    du.upload_parquet(
-        returns_updated,
-        cfg.FILE_ETF_RETURNS,
-        f"[update] ETF returns +{len(new_returns)}d to {fetch_end}"
-    )
+    log_rets = compute_returns_log(prices)
+    vol = compute_volatility(log_rets)
+    vol.columns = [f"{c}_vol" for c in vol.columns]
+    save_parquet(vol, "etf_vol")
 
-    # ── 3. New FRED macro ─────────────────────────────────────────────────────
-    logger.info("Step 3/5 — Downloading new FRED macro...")
-    # Fetch a few extra days back to catch FRED publication lags
-    fred_start = (pd.Timestamp(last_stored) - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
-    new_macro_raw = du.download_fred(start=fred_start, end=fetch_end)
+    # Always re-fetch full FRED history (catches publication lags)
+    macro = fetch_macro(start=config.DATA_START, end=end)
+    save_parquet(macro, "macro_fred")
 
-    # Keep only new dates
-    new_macro = new_macro_raw[~new_macro_raw.index.isin(macro.index)]
-    macro_updated = pd.concat([macro, new_macro]).sort_index()
-    # Re-ffill to catch any gaps
-    macro_updated = macro_updated.ffill()
+    macro_derived = compute_macro_derived(macro)
+    save_parquet(macro_derived, "macro_derived")
 
-    du.upload_parquet(
-        macro_updated,
-        cfg.FILE_MACRO_FRED,
-        f"[update] macro FRED +{len(new_macro)}d to {fetch_end}"
-    )
+    master = build_master(ohlcv, returns, macro, macro_derived)
+    save_parquet(master, "master")
 
-    # ── 4. Re-derive macro features ───────────────────────────────────────────
-    # Always recompute on full history (rolling z-scores need full window)
-    logger.info("Step 4/5 — Recomputing derived macro features...")
-    macro_derived_updated = du.compute_macro_derived(macro_updated)
-    du.upload_parquet(
-        macro_derived_updated,
-        cfg.FILE_MACRO_DERIVED,
-        f"[update] macro derived to {fetch_end}"
-    )
+    print(f"\nUpdate complete. Latest: {master.index[-1].date()}, Total days: {len(master)}")
 
-    # ── 5. Rebuild master ─────────────────────────────────────────────────────
-    logger.info("Step 5/5 — Rebuilding master aligned file...")
-    master_updated = du.build_master(
-        ohlcv_flat_updated,
-        returns_updated,
-        macro_updated,
-        macro_derived_updated,
-    )
-    du.upload_parquet(
-        master_updated,
-        cfg.FILE_MASTER,
-        f"[update] master to {fetch_end}"
-    )
 
-    # ── Metadata ──────────────────────────────────────────────────────────────
-    metadata = du.load_metadata()
-    metadata.update({
-        "last_updated":       datetime.utcnow().isoformat(),
-        "last_trading_day":   str(master_updated.index[-1].date()),
-        "n_trading_days":     len(master_updated),
-        "master_shape":       list(master_updated.shape),
-        "last_update_added":  len(new_ohlcv_flat),
-    })
-    du.upload_json(metadata, cfg.FILE_METADATA, f"[update] metadata to {fetch_end}")
+# ── Entry point ────────────────────────────────────────────────────────────────
 
-    logger.info("=" * 60)
-    logger.info("UPDATE COMPLETE")
-    logger.info(f"  New days added   : {len(new_ohlcv_flat)}")
-    logger.info(f"  Latest date      : {master_updated.index[-1].date()}")
-    logger.info(f"  Total days       : {len(master_updated)}")
-    logger.info("=" * 60)
+def seed() -> None:
+    end = datetime.today().strftime("%Y-%m-%d")
+    build_all(start=config.DATA_START, end=end)
 
 
 if __name__ == "__main__":
-    try:
-        update()
-    except Exception as e:
-        logger.error(f"Daily update failed: {e}")
-        raise
+    parser = argparse.ArgumentParser(description="P2-ETF-DEEPM dataset builder")
+    parser.add_argument(
+        "--mode",
+        choices=["seed", "incremental"],
+        default="incremental",
+        help="seed = full rebuild from 2008, incremental = append latest day",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "seed":
+        seed()
+    else:
+        incremental_update()
+
+    print("\nDataset build complete.")
