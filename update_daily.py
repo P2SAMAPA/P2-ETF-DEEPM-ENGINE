@@ -17,6 +17,7 @@ import yfinance as yf
 from fredapi import Fred
 from huggingface_hub import HfApi, hf_hub_download
 from tqdm import tqdm
+import requests
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -84,46 +85,40 @@ def hf_upload_parquet(df, filename, msg):
 
 def fetch_ohlcv_batch(tickers, start, end):
     """
-    Download OHLCV data for each ticker individually (like data_download.py)
-    with delays and retries to avoid rate limits.
+    Download OHLCV data per ticker with heavy rate‑limit avoidance.
+    Uses a custom session, random delays, and exponential backoff.
     """
     log.info(f"Downloading {len(tickers)} tickers individually from {start} to {end}")
+
+    # Create a session with browser headers
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+    })
 
     frames = []
     failed = []
 
-    # Optional: set a custom user‑agent to reduce chance of blocking
-    import requests
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
-    # Note: yfinance doesn't directly accept a session, but we can monkey‑patch
-    # or rely on default behaviour. We'll keep it simple and just use the session
-    # in our own requests if needed; for yf.download we rely on its internal session.
+    # Cooldown before first request
+    time.sleep(random.uniform(2, 5))
 
     for ticker in tqdm(tickers, desc="Tickers"):
-        # Random delay between tickers to avoid hammering the server
-        time.sleep(random.uniform(1.5, 3.5))
+        # Random delay between tickers (4–8 seconds)
+        time.sleep(random.uniform(4.0, 8.0))
 
         success = False
-        for attempt in range(3):  # max 3 attempts per ticker
+        for attempt in range(4):  # up to 4 attempts per ticker
             try:
-                df = yf.download(
-                    ticker,
-                    start=start,
-                    end=end,
-                    auto_adjust=True,
-                    progress=False,
-                    threads=False,
-                )
+                tkr = yf.Ticker(ticker, session=session)
+                df = tkr.history(start=start, end=end, auto_adjust=True)
 
                 if df.empty:
-                    # No data for this period (weekend/holiday) – not an error
                     log.debug(f"{ticker}: no data for {start}–{end}")
-                    break  # exit retry loop, no need to retry
+                    break  # no data, not an error
 
-                # Keep only OHLCV columns
                 keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
                 df = df[keep].copy()
                 if df.empty:
@@ -132,17 +127,22 @@ def fetch_ohlcv_batch(tickers, start, end):
                 df.columns = [f"{ticker}_{c}" for c in df.columns]
                 frames.append(df)
                 success = True
-                break  # success, exit retry loop
+                break
 
             except Exception as e:
-                # Real error (likely rate limit or network)
                 log.warning(f"{ticker}: attempt {attempt+1} failed: {e}")
-                if attempt < 2:  # wait before next retry
-                    wait = (2 ** attempt) * 5 + random.uniform(0, 2)
+                if "Rate limit" in str(e) or "Too Many Requests" in str(e):
+                    # Long cooldown on rate‑limit errors
+                    cooldown = random.uniform(30, 60)
+                    log.warning(f"  Rate limited – sleeping {cooldown:.0f}s")
+                    time.sleep(cooldown)
+
+                if attempt < 3:
+                    wait = (2 ** attempt) * 10 + random.uniform(0, 5)  # 10s, 20s, 40s
                     log.info(f"  Retrying {ticker} in {wait:.2f}s...")
                     time.sleep(wait)
 
-        if not success and not df.empty:  # only count as failed if we never succeeded
+        if not success and not df.empty:
             failed.append(ticker)
 
     if failed:
