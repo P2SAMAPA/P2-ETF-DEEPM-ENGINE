@@ -16,6 +16,7 @@ import pandas as pd
 import yfinance as yf
 from fredapi import Fred
 from huggingface_hub import HfApi, hf_hub_download
+from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -83,24 +84,30 @@ def hf_upload_parquet(df, filename, msg):
 
 def fetch_ohlcv_batch(tickers, start, end):
     """
-    Download data for a list of tickers individually with delays and retries.
-    This avoids rate limits by spacing requests and using exponential backoff.
+    Download OHLCV data for each ticker individually (like data_download.py)
+    with delays and retries to avoid rate limits.
     """
     log.info(f"Downloading {len(tickers)} tickers individually from {start} to {end}")
 
     frames = []
-    failed_tickers = []
+    failed = []
 
-    for idx, ticker in enumerate(tickers):
-        # Random delay between 1 and 3 seconds to mimic human behavior
-        if idx > 0:
-            delay = random.uniform(1.0, 3.0)
-            log.debug(f"Waiting {delay:.2f}s before {ticker}")
-            time.sleep(delay)
+    # Optional: set a custom user‑agent to reduce chance of blocking
+    import requests
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    # Note: yfinance doesn't directly accept a session, but we can monkey‑patch
+    # or rely on default behaviour. We'll keep it simple and just use the session
+    # in our own requests if needed; for yf.download we rely on its internal session.
 
-        # Retry logic per ticker (up to 3 attempts with exponential backoff)
+    for ticker in tqdm(tickers, desc="Tickers"):
+        # Random delay between tickers to avoid hammering the server
+        time.sleep(random.uniform(1.5, 3.5))
+
         success = False
-        for attempt in range(3):
+        for attempt in range(3):  # max 3 attempts per ticker
             try:
                 df = yf.download(
                     ticker,
@@ -112,33 +119,34 @@ def fetch_ohlcv_batch(tickers, start, end):
                 )
 
                 if df.empty:
-                    log.warning(f"{ticker}: empty data on attempt {attempt+1}")
-                else:
-                    # Extract needed columns
-                    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-                    df = df[keep].copy()
-                    if df.empty:
-                        raise ValueError("No OHLCV columns")
-                    df.columns = [f"{ticker}_{c}" for c in df.columns]
-                    frames.append(df)
-                    success = True
-                    log.info(f"{ticker}: {len(df)} rows")
-                    break  # success, exit retry loop
+                    # No data for this period (weekend/holiday) – not an error
+                    log.debug(f"{ticker}: no data for {start}–{end}")
+                    break  # exit retry loop, no need to retry
+
+                # Keep only OHLCV columns
+                keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                df = df[keep].copy()
+                if df.empty:
+                    raise ValueError("No OHLCV columns found")
+
+                df.columns = [f"{ticker}_{c}" for c in df.columns]
+                frames.append(df)
+                success = True
+                break  # success, exit retry loop
 
             except Exception as e:
-                log.warning(f"{ticker}: error on attempt {attempt+1}: {e}")
+                # Real error (likely rate limit or network)
+                log.warning(f"{ticker}: attempt {attempt+1} failed: {e}")
+                if attempt < 2:  # wait before next retry
+                    wait = (2 ** attempt) * 5 + random.uniform(0, 2)
+                    log.info(f"  Retrying {ticker} in {wait:.2f}s...")
+                    time.sleep(wait)
 
-            # Wait before retry (exponential backoff + jitter)
-            if attempt < 2:  # don't wait after last attempt
-                wait = (2 ** attempt) * 5 + random.uniform(0, 2)
-                log.info(f"Retrying {ticker} in {wait:.2f}s")
-                time.sleep(wait)
+        if not success and not df.empty:  # only count as failed if we never succeeded
+            failed.append(ticker)
 
-        if not success:
-            failed_tickers.append(ticker)
-
-    if failed_tickers:
-        log.error(f"Failed to download tickers: {failed_tickers}")
+    if failed:
+        log.error(f"Failed to download tickers: {failed}")
 
     if not frames:
         log.warning("No data downloaded for any ticker")
