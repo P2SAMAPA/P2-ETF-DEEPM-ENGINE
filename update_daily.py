@@ -7,6 +7,7 @@ rebuilds master, pushes back to HF.
 import io
 import os
 import time
+import random
 import logging
 from datetime import datetime, timedelta
 
@@ -81,45 +82,83 @@ def hf_upload_parquet(df, filename, msg):
 
 
 def fetch_ohlcv_batch(tickers, start, end):
-    """Download ALL tickers in ONE yf.download() call with retry."""
-    log.info(f"Batch downloading {len(tickers)} tickers: {start} to {end}")
+    """
+    Download data for a list of tickers individually with delays and retries.
+    This avoids rate limits by spacing requests and using exponential backoff.
+    """
+    log.info(f"Downloading {len(tickers)} tickers individually from {start} to {end}")
 
-    for attempt in range(5):
-        if attempt > 0:
-            wait = 30 * attempt
-            log.info(f"Retrying batch download in {wait}s (attempt {attempt+1}/5)...")
-            time.sleep(wait)
-
-        raw = yf.download(
-            tickers,
-            start=start,
-            end=end,
-            auto_adjust=True,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-        )
-        if not raw.empty:
-            break
-        log.warning(f"Batch attempt {attempt+1} returned empty")
-    else:
-        log.warning("All batch attempts failed")
-        return pd.DataFrame()
+    # Optional: set a session with a user agent to mimic a browser
+    session = None
+    try:
+        import requests
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        yf.set_tz_cache_location(None)  # ignore cache warning
+    except ImportError:
+        pass
 
     frames = []
-    for ticker in tickers:
-        try:
-            df = raw[ticker].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
-            if df.empty:
-                continue
-            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            df = df[keep].copy()
-            df.columns = [f"{ticker}_{c}" for c in df.columns]
-            frames.append(df)
-        except Exception as e:
-            log.warning(f"  {ticker}: {e}")
+    failed_tickers = []
+
+    for idx, ticker in enumerate(tickers):
+        # Random delay between 1 and 3 seconds to mimic human behavior
+        delay = random.uniform(1.0, 3.0)
+        if idx > 0:
+            log.debug(f"Waiting {delay:.2f}s before {ticker}")
+            time.sleep(delay)
+
+        # Retry logic per ticker (up to 3 attempts with exponential backoff)
+        success = False
+        for attempt in range(3):
+            try:
+                # Use session if available
+                kwargs = {
+                    'tickers': ticker,
+                    'start': start,
+                    'end': end,
+                    'auto_adjust': True,
+                    'progress': False,
+                    'threads': False,
+                }
+                if session:
+                    kwargs['session'] = session
+
+                df = yf.download(**kwargs)
+
+                if df.empty:
+                    log.warning(f"{ticker}: empty data on attempt {attempt+1}")
+                else:
+                    # Extract needed columns
+                    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                    df = df[keep].copy()
+                    if df.empty:
+                        raise ValueError("No OHLCV columns")
+                    df.columns = [f"{ticker}_{c}" for c in df.columns]
+                    frames.append(df)
+                    success = True
+                    log.info(f"{ticker}: {len(df)} rows")
+                    break  # success, exit retry loop
+
+            except Exception as e:
+                log.warning(f"{ticker}: error on attempt {attempt+1}: {e}")
+
+            # Wait before retry (exponential backoff + jitter)
+            if attempt < 2:  # don't wait after last attempt
+                wait = (2 ** attempt) * 5 + random.uniform(0, 2)
+                log.info(f"Retrying {ticker} in {wait:.2f}s")
+                time.sleep(wait)
+
+        if not success:
+            failed_tickers.append(ticker)
+
+    if failed_tickers:
+        log.error(f"Failed to download tickers: {failed_tickers}")
 
     if not frames:
+        log.warning("No data downloaded for any ticker")
         return pd.DataFrame()
 
     ohlcv = pd.concat(frames, axis=1).sort_index()
@@ -127,7 +166,7 @@ def fetch_ohlcv_batch(tickers, start, end):
     if ohlcv.index.tz is not None:
         ohlcv.index = ohlcv.index.tz_localize(None)
     ohlcv.index.name = "Date"
-    log.info(f"OHLCV: {ohlcv.shape} | {ohlcv.index[0].date()} to {ohlcv.index[-1].date()}")
+    log.info(f"OHLCV shape: {ohlcv.shape} | date range: {ohlcv.index[0].date()} to {ohlcv.index[-1].date()}")
     return ohlcv
 
 
