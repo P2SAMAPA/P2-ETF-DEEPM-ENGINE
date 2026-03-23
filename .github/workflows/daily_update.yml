@@ -27,7 +27,7 @@ jobs:
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           HF_TOKEN:     ${{ secrets.HF_TOKEN }}
-        run: python data_download.py --mode incremental
+        run: python update_daily.py
 
       - name: Push updated data to HuggingFace
         env:
