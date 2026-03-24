@@ -2,8 +2,9 @@ name: Daily Dataset Update
 
 on:
   schedule:
-    - cron: "0 22 * * 1-5"   # 22:00 UTC Mon-Fri (after US market close)
-  workflow_dispatch:          # manual trigger anytime
+    # Run at a random minute between 22:00 and 23:00 UTC to spread load
+    - cron: "0 22 * * 1-5"
+  workflow_dispatch:   # manual trigger
 
 jobs:
   update:
@@ -22,6 +23,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements_train.txt
+
+      - name: Add random startup delay (5-30 seconds)
+        run: sleep $((5 + RANDOM % 26))
 
       - name: Incremental data update
         env:
