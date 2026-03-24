@@ -84,16 +84,13 @@ def update_master() -> None:
                 new_macro = macro_df.iloc[[0]]
         new_macro.index = pd.to_datetime(new_macro.index)
 
-        # Align columns with existing files
-        new_ohlcv_flat = new_ohlcv_flat.reindex(ohlcv.columns, fill_value=np.nan)
-        new_macro = new_macro.reindex(macro.columns, fill_value=np.nan)
+        # Append using loc (avoids concatenation issues)
+        # Ensure new rows are aligned with existing columns
+        ohlcv.loc[target_date] = new_ohlcv_flat.iloc[0].reindex(ohlcv.columns, fill_value=np.nan)
+        macro.loc[target_date] = new_macro.iloc[0].reindex(macro.columns, fill_value=np.nan)
 
-        # Concatenate and convert indices to datetime
-        ohlcv = pd.concat([ohlcv, new_ohlcv_flat], axis=0)
-        ohlcv.index = pd.to_datetime(ohlcv.index)  # ensure homogeneous
+        # Sort index (optional, but good practice)
         ohlcv = ohlcv.sort_index()
-        macro = pd.concat([macro, new_macro], axis=0)
-        macro.index = pd.to_datetime(macro.index)
         macro = macro.sort_index()
 
         # Upload base files
