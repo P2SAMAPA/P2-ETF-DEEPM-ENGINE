@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 # update_daily.py — P2-ETF-DEEPM-ENGINE
 # Daily incremental update: fetches OHLCV for all tickers and macro data
-# for the last trading day, appends to all derived datasets.
+# for the last trading day, appends to master, and regenerates all derived
+# datasets (etf_ohlcv, etf_returns, etf_vol, macro_fred, macro_derived).
 
 import os
 import sys
@@ -119,7 +120,7 @@ def fetch_fred_data(target_date: pd.Timestamp) -> pd.Series:
     return pd.Series(data, name=target_date)
 
 
-def load_or_create(path: str, index_col: str = None) -> pd.DataFrame:
+def load_or_create(path: str) -> pd.DataFrame:
     try:
         local = hf_hub_download(
             repo_id=cfg.HF_DATASET_REPO, filename=path,
@@ -127,8 +128,8 @@ def load_or_create(path: str, index_col: str = None) -> pd.DataFrame:
             local_dir="/tmp", local_dir_use_symlinks=False,
         )
         df = pd.read_parquet(local)
-        if index_col and index_col in df.columns:
-            df.set_index(index_col, inplace=True)
+        if 'Date' in df.columns:
+            df.set_index('Date', inplace=True)
         df.index = pd.to_datetime(df.index)
         return df
     except Exception:
@@ -147,34 +148,6 @@ def save_and_upload(df: pd.DataFrame, path: str, commit_msg: str):
         commit_message=commit_msg,
     )
     log.info(f"Uploaded {path}")
-
-
-def compute_returns(ohlcv: pd.Series, existing_returns: pd.DataFrame) -> pd.Series:
-    """Compute simple returns for the new day using the last close and new close."""
-    new_close = {}
-    for ticker in cfg.ALL_TICKERS:
-        close_col = f"{ticker}_Close"
-        if close_col in ohlcv.index:
-            new_close[ticker] = ohlcv[close_col]
-        else:
-            new_close[ticker] = np.nan
-
-    if existing_returns.empty:
-        # No previous returns, cannot compute
-        return pd.Series(index=[f"{t}_Ret" for t in cfg.ALL_TICKERS], dtype=float)
-
-    last_date = existing_returns.index[-1]
-    last_close = {}
-    for ticker in cfg.ALL_TICKERS:
-        close_col = f"{ticker}_Close"
-        if close_col in existing_returns.columns:
-            # But existing_returns probably does not have close. We need the last close from OHLCV file.
-            # Better to load OHLCV file separately to get previous close.
-            pass
-    # To avoid complexity, we'll compute returns using the OHLCV file that we have already appended.
-    # We can load the full OHLCV file (which now includes the new day) and compute returns for the new day only.
-    # That's safer.
-    return pd.Series()
 
 
 def update_master() -> None:
@@ -229,18 +202,15 @@ def update_master() -> None:
     # ------------------------------------------------------------------
     # 2. Append to etf_ohlcv.parquet
     ohlcv = load_or_create(cfg.FILE_ETF_OHLCV)
-    # Ensure OHLCV columns match what we have
     new_ohlcv_row = etf_row.reindex(ohlcv.columns, fill_value=np.nan) if not ohlcv.empty else etf_row
     new_ohlcv_df = pd.DataFrame([new_ohlcv_row], index=[target_date])
     ohlcv = pd.concat([ohlcv, new_ohlcv_df]).sort_index()
     save_and_upload(ohlcv, cfg.FILE_ETF_OHLCV, f"Daily update: added {target_date.date()}")
 
     # ------------------------------------------------------------------
-    # 3. Append to etf_returns.parquet (compute simple and log returns from OHLCV)
-    # We need previous close to compute returns. Use the OHLCV file we just updated.
-    # Re‑load it (or use the one in memory) to get the previous day's close.
-    # For simplicity, we'll load the just‑saved file, but we can also compute from the existing returns.
-    ohlcv = load_or_create(cfg.FILE_ETF_OHLCV)  # includes the new row now
+    # 3. Append to etf_returns.parquet
+    # Re‑load OHLCV (includes the new row) to get previous close
+    ohlcv = load_or_create(cfg.FILE_ETF_OHLCV)
     if len(ohlcv) >= 2:
         prev = ohlcv.iloc[-2]
         curr = ohlcv.iloc[-1]
@@ -259,7 +229,6 @@ def update_master() -> None:
                     returns[f"{t}_logret"] = np.nan
         new_ret_row = pd.Series(returns, name=target_date)
         existing_ret = load_or_create(cfg.FILE_ETF_RETURNS)
-        # Ensure columns match
         if not existing_ret.empty:
             new_ret_row = new_ret_row.reindex(existing_ret.columns, fill_value=np.nan)
         new_ret_df = pd.DataFrame([new_ret_row], index=[target_date])
@@ -267,9 +236,7 @@ def update_master() -> None:
         save_and_upload(ret_df, cfg.FILE_ETF_RETURNS, f"Daily update: added {target_date.date()}")
 
     # ------------------------------------------------------------------
-    # 4. Append to etf_vol.parquet (rolling 21d volatility)
-    # Use the returns file (which now includes the new day) to compute the 21d vol for the new day.
-    # The volatility for the new day uses the last 21 returns.
+    # 4. Append to etf_vol.parquet
     ret_df = load_or_create(cfg.FILE_ETF_RETURNS)
     if not ret_df.empty and len(ret_df) >= 21:
         last_21 = ret_df.iloc[-21:]
@@ -297,16 +264,12 @@ def update_master() -> None:
 
     # ------------------------------------------------------------------
     # 6. Append to macro_derived.parquet
-    # We need the full macro_fred (including new day) to compute derived features.
-    macro_fred = load_or_create(cfg.FILE_MACRO_FRED)  # fresh load
+    macro_fred = load_or_create(cfg.FILE_MACRO_FRED)  # fresh load with new row
     if not macro_fred.empty:
-        # Compute derived features only for the new date
-        derived_full = compute_macro_features(macro_fred)  # this recomputes all rows
-        # But we only want the last row (new date) to append
+        derived_full = compute_macro_features(macro_fred)  # recompute all rows (acceptable)
         new_derived = derived_full.iloc[[-1]].copy()
         existing_derived = load_or_create(cfg.FILE_MACRO_DERIVED)
         if not existing_derived.empty:
-            # Ensure columns align
             new_derived = new_derived.reindex(existing_derived.columns, fill_value=np.nan)
         derived_df = pd.concat([existing_derived, new_derived]).sort_index()
         save_and_upload(derived_df, cfg.FILE_MACRO_DERIVED, f"Daily update: added {target_date.date()}")
