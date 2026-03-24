@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 import torch
+from huggingface_hub import HfApi   # <-- added for upload
 
 import config as cfg
 import loader
@@ -246,6 +247,7 @@ def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
 # ── History + save ─────────────────────────────────────────────────────────────
 
 def update_signal_history(signal: dict, option: str) -> None:
+    """Append new signal to local history and upload to Hugging Face."""
     history_path = os.path.join(cfg.MODELS_DIR, f"signal_history_{option}.json")
     history = []
     if os.path.exists(history_path):
@@ -262,9 +264,25 @@ def update_signal_history(signal: dict, option: str) -> None:
     if record["signal_date"] not in existing_dates:
         history.append(record)
 
+    # Save locally
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"[predict] History updated: {len(history)} records for Option {option}")
+
+    # Upload to Hugging Face
+    try:
+        api = HfApi(token=cfg.HF_TOKEN)
+        with open(history_path, "rb") as f:
+            api.upload_file(
+                path_or_fileobj=f,
+                path_in_repo=f"models/signal_history_{option}.json",
+                repo_id=cfg.HF_DATASET_REPO,
+                repo_type="dataset",
+                commit_message=f"Update signal history for Option {option} ({record['signal_date']})"
+            )
+        print(f"[predict] Uploaded history for Option {option}")
+    except Exception as e:
+        print(f"[predict] WARNING: Failed to upload history for Option {option}: {e}")
 
 
 def save_signals(
