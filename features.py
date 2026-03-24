@@ -213,12 +213,15 @@ def build_labels(
 # ── Scaler ─────────────────────────────────────────────────────────────────────
 
 class FeatureScaler:
-    """RobustScaler fitted on training data only — no data leakage."""
+    """RobustScaler fitted on training data only — no data leakage.
+    Handles the case where macro features are absent (Fm = 0).
+    """
 
     def __init__(self):
         self.asset_scaler = RobustScaler()
         self.macro_scaler = RobustScaler()
         self._fitted = False
+        self._has_macro = None
 
     def fit(self, X_asset: np.ndarray, X_macro: np.ndarray):
         """
@@ -227,16 +230,25 @@ class FeatureScaler:
         """
         N, A, L, Fa = X_asset.shape
         self.asset_scaler.fit(X_asset.reshape(-1, Fa))
+
         N, L, Fm = X_macro.shape
-        self.macro_scaler.fit(X_macro.reshape(-1, Fm))
+        self._has_macro = (Fm > 0)
+        if self._has_macro:
+            self.macro_scaler.fit(X_macro.reshape(-1, Fm))
+
         self._fitted = True
         return self
 
     def transform(self, X_asset: np.ndarray, X_macro: np.ndarray):
         N, A, L, Fa = X_asset.shape
         Xa = self.asset_scaler.transform(X_asset.reshape(-1, Fa)).reshape(N, A, L, Fa)
+
         N, L, Fm = X_macro.shape
-        Xm = self.macro_scaler.transform(X_macro.reshape(-1, Fm)).reshape(N, L, Fm)
+        if self._has_macro and Fm > 0:
+            Xm = self.macro_scaler.transform(X_macro.reshape(-1, Fm)).reshape(N, L, Fm)
+        else:
+            Xm = X_macro  # keep as is (should be zeros anyway)
+
         return Xa.astype(np.float32), Xm.astype(np.float32)
 
     def fit_transform(self, X_asset: np.ndarray, X_macro: np.ndarray):
