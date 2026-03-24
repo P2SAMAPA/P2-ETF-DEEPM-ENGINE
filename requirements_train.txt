@@ -12,3 +12,4 @@ scikit-learn==1.5.0
 tqdm==4.66.4
 plotly==5.22.0
 streamlit==1.35.0
+pandas_market_calendars
