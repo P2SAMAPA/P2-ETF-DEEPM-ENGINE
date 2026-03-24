@@ -33,6 +33,23 @@ jobs:
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
           HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
         run: python update_daily.py
+        
+      - name: Verify updated data
+        run: |
+          python -c "
+          import pandas as pd
+          from huggingface_hub import hf_hub_download
+          path = hf_hub_download(
+              repo_id='${{ secrets.HF_DATASET_REPO }}',
+              filename='data/master.parquet',
+              repo_type='dataset',
+              token='${{ secrets.HF_TOKEN }}',
+              force_download=True
+          )
+          df = pd.read_parquet(path)
+          print('Last 5 dates in master:')
+          print(df.index[-5:])
+          "
 
       - name: Confirm update
         run: echo "Daily update complete."
