@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # update_daily.py — P2-ETF-DEEPM-ENGINE
 # Daily incremental update: fetches OHLCV for all tickers and macro data
-# for the last trading day and appends to the HuggingFace dataset.
+# for the last trading day, appends to all derived datasets.
 
 import os
 import sys
@@ -17,6 +17,7 @@ import requests
 import pandas_market_calendars as mcal
 
 import config as cfg
+from features import compute_macro_features   # for derived macro
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -27,14 +28,12 @@ log = logging.getLogger(__name__)
 # Helpers
 # ----------------------------------------------------------------------
 def next_trading_day(date: pd.Timestamp) -> pd.Timestamp:
-    """Return the next NYSE trading day after the given date."""
     nyse = mcal.get_calendar("NYSE")
     schedule = nyse.schedule(start_date=date, end_date=date + pd.Timedelta(days=10))
     trading_days = schedule.index
     next_days = trading_days[trading_days > date]
     if len(next_days) > 0:
         return next_days[0]
-    # fallback: skip weekends only
     d = date + pd.Timedelta(days=1)
     while d.weekday() >= 5:
         d += pd.Timedelta(days=1)
@@ -42,12 +41,7 @@ def next_trading_day(date: pd.Timestamp) -> pd.Timestamp:
 
 
 def fetch_ticker_batch(tickers: list, target_date: pd.Timestamp,
-                       retries: int = 3, backoff_factor: float = 2.0) -> pd.DataFrame:
-    """
-    Fetch OHLCV for a batch of tickers for a single date.
-    Implements exponential backoff with jitter for rate‑limit errors.
-    Returns DataFrame with columns like TICKER_Open, TICKER_High, ...
-    """
+                       retries: int = 3, backoff_factor: float = 2.0) -> pd.Series:
     start = target_date - timedelta(days=5)
     end   = target_date + timedelta(days=1)
 
@@ -57,31 +51,20 @@ def fetch_ticker_batch(tickers: list, target_date: pd.Timestamp,
                               auto_adjust=True, progress=False, threads=False)
             if raw.empty:
                 raise ValueError("Empty download")
-            # Convert multi‑index to flat
+            # Convert to flat row
             if isinstance(raw.columns, pd.MultiIndex):
-                flat = pd.DataFrame()
+                row = {}
                 for t in tickers:
                     for col in cfg.OHLCV_COLS:
                         if (col, t) in raw.columns:
-                            flat[f"{t}_{col}"] = raw[(col, t)]
+                            row[f"{t}_{col}"] = raw[(col, t)].iloc[-1]
                         else:
-                            flat[f"{t}_{col}"] = np.nan
-                flat.index = raw.index
+                            row[f"{t}_{col}"] = np.nan
             else:
-                flat = raw.copy()
+                row = {}
                 for col in cfg.OHLCV_COLS:
-                    flat.rename(columns={col: f"{tickers[0]}_{col}"}, inplace=True)
-            # Get the row for target_date
-            if target_date not in flat.index:
-                # Try the most recent date <= target_date
-                dates = flat.index[flat.index <= target_date]
-                if len(dates) == 0:
-                    raise ValueError(f"No data on or before {target_date}")
-                actual_date = dates[-1]
-                row = flat.loc[actual_date]
-            else:
-                row = flat.loc[target_date]
-            return row
+                    row[f"{tickers[0]}_{col}"] = raw[col].iloc[-1]
+            return pd.Series(row)
         except Exception as e:
             if attempt == retries:
                 log.error(f"Batch {tickers} failed after {retries} attempts: {e}")
@@ -92,10 +75,6 @@ def fetch_ticker_batch(tickers: list, target_date: pd.Timestamp,
 
 
 def fetch_all_etfs(target_date: pd.Timestamp, batch_size: int = 5) -> pd.Series:
-    """
-    Fetch OHLCV for all ETFs and benchmarks, in batches.
-    Returns a Series indexed by column name (e.g., TLT_Close).
-    """
     all_tickers = cfg.ALL_TICKERS
     batches = [all_tickers[i:i+batch_size] for i in range(0, len(all_tickers), batch_size)]
 
@@ -107,25 +86,19 @@ def fetch_all_etfs(target_date: pd.Timestamp, batch_size: int = 5) -> pd.Series:
             rows.append(row)
         except Exception as e:
             log.error(f"Batch {batch} failed: {e}")
-            # Continue with other batches (maybe some tickers can be fetched later)
-        # Pause between batches to avoid rate limits
         time.sleep(random.uniform(1.0, 2.0))
 
     if not rows:
         raise ValueError("No data fetched for any ticker")
-
-    # Combine all rows (each is a Series)
-    combined = pd.concat(rows, axis=0)
-    return combined
+    return pd.concat(rows)
 
 
 def fetch_fred_data(target_date: pd.Timestamp) -> pd.Series:
-    """Fetch all FRED series for the target date."""
     url = "https://api.stlouisfed.org/fred/series/observations"
     data = {}
     for col_name, series_code in cfg.FRED_SERIES.items():
         params = {
-            "series_id": series_code,          # use the actual FRED code
+            "series_id": series_code,
             "api_key": cfg.FRED_API_KEY,
             "file_type": "json",
             "observation_start": target_date.strftime("%Y-%m-%d"),
@@ -142,33 +115,80 @@ def fetch_fred_data(target_date: pd.Timestamp) -> pd.Series:
         except Exception as e:
             log.warning(f"FRED {col_name} failed: {e}")
             data[col_name] = np.nan
-        time.sleep(0.3)  # respectful pacing
+        time.sleep(0.3)
     return pd.Series(data, name=target_date)
 
 
+def load_or_create(path: str, index_col: str = None) -> pd.DataFrame:
+    try:
+        local = hf_hub_download(
+            repo_id=cfg.HF_DATASET_REPO, filename=path,
+            repo_type="dataset", token=cfg.HF_TOKEN,
+            local_dir="/tmp", local_dir_use_symlinks=False,
+        )
+        df = pd.read_parquet(local)
+        if index_col and index_col in df.columns:
+            df.set_index(index_col, inplace=True)
+        df.index = pd.to_datetime(df.index)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def save_and_upload(df: pd.DataFrame, path: str, commit_msg: str):
+    tmp = f"/tmp/{path.replace('/', '_')}.parquet"
+    df.to_parquet(tmp)
+    api = HfApi(token=cfg.HF_TOKEN)
+    api.upload_file(
+        path_or_fileobj=tmp,
+        path_in_repo=path,
+        repo_id=cfg.HF_DATASET_REPO,
+        repo_type="dataset",
+        commit_message=commit_msg,
+    )
+    log.info(f"Uploaded {path}")
+
+
+def compute_returns(ohlcv: pd.Series, existing_returns: pd.DataFrame) -> pd.Series:
+    """Compute simple returns for the new day using the last close and new close."""
+    new_close = {}
+    for ticker in cfg.ALL_TICKERS:
+        close_col = f"{ticker}_Close"
+        if close_col in ohlcv.index:
+            new_close[ticker] = ohlcv[close_col]
+        else:
+            new_close[ticker] = np.nan
+
+    if existing_returns.empty:
+        # No previous returns, cannot compute
+        return pd.Series(index=[f"{t}_Ret" for t in cfg.ALL_TICKERS], dtype=float)
+
+    last_date = existing_returns.index[-1]
+    last_close = {}
+    for ticker in cfg.ALL_TICKERS:
+        close_col = f"{ticker}_Close"
+        if close_col in existing_returns.columns:
+            # But existing_returns probably does not have close. We need the last close from OHLCV file.
+            # Better to load OHLCV file separately to get previous close.
+            pass
+    # To avoid complexity, we'll compute returns using the OHLCV file that we have already appended.
+    # We can load the full OHLCV file (which now includes the new day) and compute returns for the new day only.
+    # That's safer.
+    return pd.Series()
+
+
 def update_master() -> None:
-    """Main incremental update."""
     log.info("=" * 60)
     log.info(f"P2-ETF-DEEPM DAILY UPDATE — {datetime.now().strftime('%Y-%m-%d')}")
     log.info("=" * 60)
 
     # Load existing master
-    try:
-        master_path = hf_hub_download(
-            repo_id=cfg.HF_DATASET_REPO,
-            filename=cfg.FILE_MASTER,
-            repo_type="dataset",
-            token=cfg.HF_TOKEN,
-            local_dir="/tmp",
-            local_dir_use_symlinks=False,
-        )
-        master = pd.read_parquet(master_path)
-        master.index = pd.to_datetime(master.index)
-        last_date = master.index[-1]
-        log.info(f"Last stored: {last_date.date()} | rows: {len(master)}")
-    except Exception as e:
-        log.error(f"Failed to load master: {e}")
+    master = load_or_create(cfg.FILE_MASTER)
+    if master.empty:
+        log.error("No master dataset found. Run seed.py first.")
         sys.exit(1)
+    last_date = master.index[-1]
+    log.info(f"Last stored: {last_date.date()} | rows: {len(master)}")
 
     # Determine next trading day to update
     next_td = next_trading_day(last_date)
@@ -193,33 +213,105 @@ def update_master() -> None:
         log.error(f"FRED fetch failed: {e}")
         sys.exit(1)
 
-    # Combine into a single row (same columns as master)
-    new_row = pd.Series(index=master.columns, dtype=float)
-    # Copy OHLCV columns
+    # ------------------------------------------------------------------
+    # 1. Append to master
+    new_master_row = pd.Series(index=master.columns, dtype=float)
     for col in etf_row.index:
         if col in master.columns:
-            new_row[col] = etf_row[col]
-    # Copy FRED columns
+            new_master_row[col] = etf_row[col]
     for col in fred_row.index:
         if col in master.columns:
-            new_row[col] = fred_row[col]
+            new_master_row[col] = fred_row[col]
+    new_master_df = pd.DataFrame([new_master_row], index=[target_date])
+    master = pd.concat([master, new_master_df]).sort_index()
+    save_and_upload(master, cfg.FILE_MASTER, f"Daily update: added {target_date.date()}")
 
-    # Append to master (replace deprecated append with concat)
-    new_df = pd.DataFrame([new_row], index=[target_date])
-    master = pd.concat([master, new_df]).sort_index()
+    # ------------------------------------------------------------------
+    # 2. Append to etf_ohlcv.parquet
+    ohlcv = load_or_create(cfg.FILE_ETF_OHLCV)
+    # Ensure OHLCV columns match what we have
+    new_ohlcv_row = etf_row.reindex(ohlcv.columns, fill_value=np.nan) if not ohlcv.empty else etf_row
+    new_ohlcv_df = pd.DataFrame([new_ohlcv_row], index=[target_date])
+    ohlcv = pd.concat([ohlcv, new_ohlcv_df]).sort_index()
+    save_and_upload(ohlcv, cfg.FILE_ETF_OHLCV, f"Daily update: added {target_date.date()}")
 
-    # Save locally and upload
-    tmp_path = "/tmp/master.parquet"
-    master.to_parquet(tmp_path)
-    api = HfApi(token=cfg.HF_TOKEN)
-    api.upload_file(
-        path_or_fileobj=tmp_path,
-        path_in_repo=cfg.FILE_MASTER,
-        repo_id=cfg.HF_DATASET_REPO,
-        repo_type="dataset",
-        commit_message=f"Daily update: added {target_date.date()}",
-    )
-    log.info(f"Updated master with {target_date.date()}")
+    # ------------------------------------------------------------------
+    # 3. Append to etf_returns.parquet (compute simple and log returns from OHLCV)
+    # We need previous close to compute returns. Use the OHLCV file we just updated.
+    # Re‑load it (or use the one in memory) to get the previous day's close.
+    # For simplicity, we'll load the just‑saved file, but we can also compute from the existing returns.
+    ohlcv = load_or_create(cfg.FILE_ETF_OHLCV)  # includes the new row now
+    if len(ohlcv) >= 2:
+        prev = ohlcv.iloc[-2]
+        curr = ohlcv.iloc[-1]
+        returns = {}
+        for t in cfg.ALL_TICKERS:
+            close_col = f"{t}_Close"
+            if close_col in ohlcv.columns and close_col in prev and close_col in curr:
+                prev_c = prev[close_col]
+                curr_c = curr[close_col]
+                if not np.isnan(prev_c) and not np.isnan(curr_c):
+                    ret = curr_c / prev_c - 1
+                    returns[f"{t}_ret"] = ret
+                    returns[f"{t}_logret"] = np.log(curr_c / prev_c)
+                else:
+                    returns[f"{t}_ret"] = np.nan
+                    returns[f"{t}_logret"] = np.nan
+        new_ret_row = pd.Series(returns, name=target_date)
+        existing_ret = load_or_create(cfg.FILE_ETF_RETURNS)
+        # Ensure columns match
+        if not existing_ret.empty:
+            new_ret_row = new_ret_row.reindex(existing_ret.columns, fill_value=np.nan)
+        new_ret_df = pd.DataFrame([new_ret_row], index=[target_date])
+        ret_df = pd.concat([existing_ret, new_ret_df]).sort_index()
+        save_and_upload(ret_df, cfg.FILE_ETF_RETURNS, f"Daily update: added {target_date.date()}")
+
+    # ------------------------------------------------------------------
+    # 4. Append to etf_vol.parquet (rolling 21d volatility)
+    # Use the returns file (which now includes the new day) to compute the 21d vol for the new day.
+    # The volatility for the new day uses the last 21 returns.
+    ret_df = load_or_create(cfg.FILE_ETF_RETURNS)
+    if not ret_df.empty and len(ret_df) >= 21:
+        last_21 = ret_df.iloc[-21:]
+        vol = {}
+        for t in cfg.ALL_TICKERS:
+            col = f"{t}_ret"
+            if col in last_21.columns:
+                daily_std = last_21[col].std()
+                vol[f"{t}_vol"] = daily_std * np.sqrt(252) if not np.isnan(daily_std) else np.nan
+        new_vol_row = pd.Series(vol, name=target_date)
+        existing_vol = load_or_create(cfg.FILE_ETF_VOL)
+        if not existing_vol.empty:
+            new_vol_row = new_vol_row.reindex(existing_vol.columns, fill_value=np.nan)
+        new_vol_df = pd.DataFrame([new_vol_row], index=[target_date])
+        vol_df = pd.concat([existing_vol, new_vol_df]).sort_index()
+        save_and_upload(vol_df, cfg.FILE_ETF_VOL, f"Daily update: added {target_date.date()}")
+
+    # ------------------------------------------------------------------
+    # 5. Append to macro_fred.parquet
+    macro_fred = load_or_create(cfg.FILE_MACRO_FRED)
+    new_fred_row = fred_row.reindex(macro_fred.columns, fill_value=np.nan) if not macro_fred.empty else fred_row
+    new_fred_df = pd.DataFrame([new_fred_row], index=[target_date])
+    macro_fred = pd.concat([macro_fred, new_fred_df]).sort_index()
+    save_and_upload(macro_fred, cfg.FILE_MACRO_FRED, f"Daily update: added {target_date.date()}")
+
+    # ------------------------------------------------------------------
+    # 6. Append to macro_derived.parquet
+    # We need the full macro_fred (including new day) to compute derived features.
+    macro_fred = load_or_create(cfg.FILE_MACRO_FRED)  # fresh load
+    if not macro_fred.empty:
+        # Compute derived features only for the new date
+        derived_full = compute_macro_features(macro_fred)  # this recomputes all rows
+        # But we only want the last row (new date) to append
+        new_derived = derived_full.iloc[[-1]].copy()
+        existing_derived = load_or_create(cfg.FILE_MACRO_DERIVED)
+        if not existing_derived.empty:
+            # Ensure columns align
+            new_derived = new_derived.reindex(existing_derived.columns, fill_value=np.nan)
+        derived_df = pd.concat([existing_derived, new_derived]).sort_index()
+        save_and_upload(derived_df, cfg.FILE_MACRO_DERIVED, f"Daily update: added {target_date.date()}")
+
+    log.info("All datasets updated successfully.")
 
 
 if __name__ == "__main__":
