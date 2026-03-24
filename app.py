@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from huggingface_hub import hf_hub_download
+import pandas_market_calendars as mcal   # <-- added for next trading day
 
 import config as cfg
 
@@ -125,6 +126,21 @@ def load_signals() -> dict:
         "Aw": raw.get("option_A_window") or {},
         "Bw": raw.get("option_B_window") or {},
     }
+
+
+# ── Helper: next trading day (with NYSE calendar) ──────────────────────────────
+
+nyse = mcal.get_calendar("NYSE")
+
+def next_trading_day(date: pd.Timestamp) -> pd.Timestamp:
+    """Return the next NYSE trading day after the given date."""
+    schedule = nyse.schedule(start_date=date, end_date=date + pd.Timedelta(days=10))
+    trading_days = schedule.index
+    next_days = trading_days[trading_days > date]
+    if len(next_days) > 0:
+        return next_days[0]
+    # fallback (should not happen for valid dates)
+    return date + pd.Timedelta(days=1)
 
 
 # ── Backtest ───────────────────────────────────────────────────────────────────
@@ -249,7 +265,19 @@ def render_hero(sig_fixed: dict, sig_window: dict, option: str):
     t2 = picks[1] if len(picks) > 1 else None
     t3 = picks[2] if len(picks) > 2 else None
 
-    sig_date = best.get("signal_date", "—")
+    # --- Date handling: prefer signal_date, else compute from last_data_date ---
+    sig_date = best.get("signal_date")
+    if not sig_date:
+        last_date_str = best.get("last_data_date")
+        if last_date_str:
+            try:
+                last_date = pd.Timestamp(last_date_str)
+                sig_date = next_trading_day(last_date).strftime("%Y-%m-%d")
+            except Exception:
+                sig_date = "unknown"
+        else:
+            sig_date = "unknown"
+
     gen      = best.get("generated_at", "")
     try:
         gen = datetime.fromisoformat(gen).strftime("%Y-%m-%d %H:%M UTC")
