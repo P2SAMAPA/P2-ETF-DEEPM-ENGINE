@@ -30,6 +30,10 @@ def update_master() -> None:
         log.error("Base files missing. Run seed.py first.")
         sys.exit(1)
 
+    # Ensure indices are datetime
+    ohlcv.index = pd.to_datetime(ohlcv.index)
+    macro.index = pd.to_datetime(macro.index)
+
     last_date = ohlcv.index[-1]
     log.info(f"Last stored OHLCV date: {last_date.date()}")
 
@@ -51,27 +55,31 @@ def update_master() -> None:
             log.error("Failed to fetch OHLCV data.")
             sys.exit(1)
         new_ohlcv_flat = du.flatten_ohlcv(ohlcv_multi)
+        new_ohlcv_flat.index = pd.to_datetime(new_ohlcv_flat.index)
 
-        # Fetch new FRED macro data for the same day (only the target date, not +1)
+        # Fetch new FRED macro data for the same day (only the target date)
         macro_df = du.download_fred(start=start, end=start)   # single day
         if macro_df.empty:
             log.warning("FRED data not available; using NaNs.")
             new_macro = pd.DataFrame(index=[target_date], columns=cfg.FRED_SERIES.keys(), dtype=float)
         else:
-            # macro_df may have index of trading days; we want the row for target_date
-            # Ensure it's a single row
-            if len(macro_df) > 1:
-                # Should not happen with start=end, but just in case, keep only the target
-                macro_df = macro_df[macro_df.index == target_date]
-            new_macro = macro_df.iloc[[0]] if not macro_df.empty else pd.DataFrame(index=[target_date], columns=cfg.FRED_SERIES.keys(), dtype=float)
+            # Ensure we have exactly the target date
+            if target_date in macro_df.index:
+                new_macro = macro_df.loc[[target_date]]
+            else:
+                # Use the first row if target not present (should not happen)
+                new_macro = macro_df.iloc[[0]]
+        new_macro.index = pd.to_datetime(new_macro.index)
 
         # Append to base files
         # Align columns with existing files
         new_ohlcv_flat = new_ohlcv_flat.reindex(ohlcv.columns, fill_value=np.nan)
         new_macro = new_macro.reindex(macro.columns, fill_value=np.nan)
 
-        ohlcv = pd.concat([ohlcv, new_ohlcv_flat], axis=0).sort_index()
-        macro = pd.concat([macro, new_macro], axis=0).sort_index()
+        ohlcv = pd.concat([ohlcv, new_ohlcv_flat], axis=0)
+        ohlcv = ohlcv.sort_index()
+        macro = pd.concat([macro, new_macro], axis=0)
+        macro = macro.sort_index()
 
         # Upload base files
         du.upload_parquet(ohlcv, cfg.FILE_ETF_OHLCV, f"Daily update: added {target_date.date()}")
