@@ -123,9 +123,9 @@ def fetch_fred_data(target_date: pd.Timestamp) -> pd.Series:
     """Fetch all FRED series for the target date."""
     url = "https://api.stlouisfed.org/fred/series/observations"
     data = {}
-    for series_id, desc in cfg.FRED_SERIES.items():
+    for col_name, series_code in cfg.FRED_SERIES.items():
         params = {
-            "series_id": series_id,
+            "series_id": series_code,          # use the actual FRED code
             "api_key": cfg.FRED_API_KEY,
             "file_type": "json",
             "observation_start": target_date.strftime("%Y-%m-%d"),
@@ -136,12 +136,12 @@ def fetch_fred_data(target_date: pd.Timestamp) -> pd.Series:
             r.raise_for_status()
             obs = r.json().get("observations", [])
             if obs:
-                data[series_id] = float(obs[0]["value"])
+                data[col_name] = float(obs[0]["value"])
             else:
-                data[series_id] = np.nan
+                data[col_name] = np.nan
         except Exception as e:
-            log.warning(f"FRED {series_id} failed: {e}")
-            data[series_id] = np.nan
+            log.warning(f"FRED {col_name} failed: {e}")
+            data[col_name] = np.nan
         time.sleep(0.3)  # respectful pacing
     return pd.Series(data, name=target_date)
 
@@ -204,9 +204,9 @@ def update_master() -> None:
         if col in master.columns:
             new_row[col] = fred_row[col]
 
-    # Append to master
-    new_row.name = target_date
-    master = master.append(new_row).sort_index()
+    # Append to master (replace deprecated append with concat)
+    new_df = pd.DataFrame([new_row], index=[target_date])
+    master = pd.concat([master, new_df]).sort_index()
 
     # Save locally and upload
     tmp_path = "/tmp/master.parquet"
