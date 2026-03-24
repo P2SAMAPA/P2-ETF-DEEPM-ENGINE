@@ -95,7 +95,6 @@ def fetch_all_etfs(target_date: pd.Timestamp, batch_size: int = 5) -> pd.Series:
 def fetch_fred_row(target_date: pd.Timestamp) -> pd.Series:
     """Fetch FRED data for a single date and return as a Series."""
     # Use download_fred from data_utils with a narrow date range
-    # We'll fetch from target_date to target_date
     start = target_date.strftime("%Y-%m-%d")
     end   = start
     df = du.download_fred(start=start, end=end)
