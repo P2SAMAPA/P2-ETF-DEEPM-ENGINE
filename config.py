@@ -73,6 +73,7 @@ MACRO_CORE = ["VIX", "T10Y2Y", "HY_SPREAD", "USD_INDEX", "DTB3"]
 # ── Parquet filenames in HF dataset ───────────────────────────────────────────
 FILE_ETF_OHLCV      = "data/etf_ohlcv.parquet"
 FILE_ETF_RETURNS    = "data/etf_returns.parquet"
+FILE_ETF_VOL        = "data/etf_vol.parquet"          # <-- added
 FILE_MACRO_FRED     = "data/macro_fred.parquet"
 FILE_MACRO_DERIVED  = "data/macro_derived.parquet"
 FILE_MASTER         = "data/master.parquet"
