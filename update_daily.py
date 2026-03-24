@@ -86,8 +86,8 @@ def hf_upload_parquet(df, filename, msg):
 
 def fetch_ohlcv_batch(tickers, start, end):
     """
-    Fetch data day by day to reduce the amount of data per request.
-    For each trading day in the range, download all tickers in one batch.
+    Fetch data day by day with large delays between days and very long cooldowns on rate limits.
+    This is intentionally slow to avoid being blocked.
     """
     start_date = pd.to_datetime(start)
     end_date = pd.to_datetime(end)
@@ -95,21 +95,23 @@ def fetch_ohlcv_batch(tickers, start, end):
     if len(date_range) == 0:
         return pd.DataFrame()
 
-    log.info(f"Fetching {len(tickers)} tickers for {len(date_range)} day(s)")
+    log.info(f"Fetching {len(tickers)} tickers for {len(date_range)} day(s) (very slow mode)")
 
     all_frames = []
-    for target_date in tqdm(date_range, desc="Days"):
+    for idx, target_date in enumerate(date_range):
         target_str = target_date.strftime('%Y-%m-%d')
-        # Random delay between days to spread load
-        if len(all_frames) > 0:
-            delay = random.uniform(2, 5)
-            log.debug(f"Waiting {delay:.2f}s before next day")
-            time.sleep(delay)
+        log.info(f"Processing day {idx+1}/{len(date_range)}: {target_str}")
 
         success = False
         for attempt in range(3):  # up to 3 attempts per day
             try:
-                # Request a small range (2 days before, 1 after) to ensure we get the target day
+                # Long delay before each day's request (10–20 seconds)
+                if idx > 0 or attempt > 0:
+                    delay = random.uniform(10, 20)
+                    log.debug(f"Waiting {delay:.2f}s before request")
+                    time.sleep(delay)
+
+                # Request a small window around the target date to ensure we get the data
                 start_range = (target_date - timedelta(days=2)).strftime('%Y-%m-%d')
                 end_range = (target_date + timedelta(days=1)).strftime('%Y-%m-%d')
 
@@ -120,29 +122,22 @@ def fetch_ohlcv_batch(tickers, start, end):
                     auto_adjust=False,
                     progress=False,
                     group_by='ticker',
-                    threads=True,
+                    threads=False,          # no threading to keep it simple
                 )
 
                 if raw.empty:
                     log.warning(f"Day {target_str}: empty download (attempt {attempt+1})")
-                    if attempt < 2:
-                        wait = (2 ** attempt) * 5 + random.uniform(0, 2)
-                        log.info(f"Retrying in {wait:.2f}s")
-                        time.sleep(wait)
                     continue
 
                 # Handle single ticker case
                 if len(tickers) == 1:
                     raw.columns = pd.MultiIndex.from_tuples([(tickers[0], col) for col in raw.columns])
 
-                # Filter to the exact target date
+                # Filter to exact target date
                 mask = raw.index.date == target_date.date()
                 day_data = raw[mask]
                 if day_data.empty:
                     log.warning(f"Day {target_str}: no data after date filter (attempt {attempt+1})")
-                    if attempt < 2:
-                        wait = (2 ** attempt) * 5 + random.uniform(0, 2)
-                        time.sleep(wait)
                     continue
 
                 # Keep OHLCV fields
@@ -150,12 +145,9 @@ def fetch_ohlcv_batch(tickers, start, end):
                 day_data = day_data[valid_cols]
                 if day_data.empty:
                     log.warning(f"Day {target_str}: no OHLCV fields (attempt {attempt+1})")
-                    if attempt < 2:
-                        wait = (2 ** attempt) * 5 + random.uniform(0, 2)
-                        time.sleep(wait)
                     continue
 
-                # Convert to flat columns (ticker_Open, ...)
+                # Convert to flat columns
                 frames = []
                 for t in tickers:
                     if t in day_data.columns.get_level_values(0):
@@ -165,9 +157,6 @@ def fetch_ohlcv_batch(tickers, start, end):
 
                 if not frames:
                     log.warning(f"Day {target_str}: no ticker data (attempt {attempt+1})")
-                    if attempt < 2:
-                        wait = (2 ** attempt) * 5 + random.uniform(0, 2)
-                        time.sleep(wait)
                     continue
 
                 day_combined = pd.concat(frames, axis=1)
@@ -176,17 +165,24 @@ def fetch_ohlcv_batch(tickers, start, end):
                     day_combined.index = day_combined.index.tz_localize(None)
                 all_frames.append(day_combined)
                 success = True
-                break  # success for this day
+                log.info(f"Day {target_str}: fetched {len(day_combined.columns)} columns")
+                break
 
             except Exception as e:
-                log.warning(f"Day {target_str}: error on attempt {attempt+1}: {e}")
-                if attempt < 2:
-                    wait = (2 ** attempt) * 5 + random.uniform(0, 2)
+                log.error(f"Day {target_str}: error on attempt {attempt+1}: {e}")
+                if "Rate limit" in str(e) or "Too Many Requests" in str(e):
+                    # Long cooldown for rate limits (2–5 minutes)
+                    cooldown = random.uniform(120, 300)
+                    log.warning(f"Rate limit detected – sleeping {cooldown:.0f}s")
+                    time.sleep(cooldown)
+                elif attempt < 2:
+                    wait = random.uniform(30, 60)   # generic error wait
                     log.info(f"Retrying in {wait:.2f}s")
                     time.sleep(wait)
 
         if not success:
-            log.error(f"Failed to fetch data for {target_str} after retries")
+            log.error(f"Day {target_str}: failed after retries – skipping")
+            # We could decide to stop entirely, but we'll skip this day
 
     if not all_frames:
         log.warning("No data downloaded for any day")
