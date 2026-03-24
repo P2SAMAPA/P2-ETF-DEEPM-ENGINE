@@ -115,3 +115,6 @@ MODELS_DIR          = "models"
 # ── GitHub Actions schedule ───────────────────────────────────────────────────
 # Daily update runs at 22:00 UTC Mon-Fri (after US market close)
 CRON_SCHEDULE       = "0 22 * * 1-5"
+
+# ── OHLCV columns stored per ticker (used by update_daily.py) ─────────────────
+OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
