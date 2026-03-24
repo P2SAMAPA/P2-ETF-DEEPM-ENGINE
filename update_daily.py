@@ -8,6 +8,8 @@ import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+import time
+import random
 
 import config as cfg
 import data_utils as du
@@ -15,6 +17,18 @@ import data_utils as du
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+
+
+def fetch_ohlcv_with_retry(tickers, start, end, max_retries=3):
+    """Wrapper for du.download_ohlcv with retries for transient errors."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            return du.download_ohlcv(tickers, start=start, end=end)
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            log.warning(f"OHLCV download attempt {attempt} failed: {e}. Retrying in {2**attempt}s")
+            time.sleep(2**attempt + random.uniform(0, 1))
 
 
 def update_master() -> None:
@@ -30,7 +44,7 @@ def update_master() -> None:
         log.error("Base files missing. Run seed.py first.")
         sys.exit(1)
 
-    # Ensure indices are datetime (already done in load_parquet, but double‑check)
+    # Ensure indices are datetime
     ohlcv.index = pd.to_datetime(ohlcv.index)
     macro.index = pd.to_datetime(macro.index)
 
@@ -50,7 +64,7 @@ def update_master() -> None:
         # Fetch new OHLCV for the single day
         start = target_date.strftime("%Y-%m-%d")
         end   = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
-        ohlcv_multi = du.download_ohlcv(cfg.ALL_TICKERS, start=start, end=end)
+        ohlcv_multi = fetch_ohlcv_with_retry(cfg.ALL_TICKERS, start=start, end=end)
         if ohlcv_multi.empty:
             log.error("Failed to fetch OHLCV data.")
             sys.exit(1)
@@ -63,24 +77,23 @@ def update_master() -> None:
             log.warning("FRED data not available; using NaNs.")
             new_macro = pd.DataFrame(index=[target_date], columns=cfg.FRED_SERIES.keys(), dtype=float)
         else:
-            # Ensure we have exactly the target date
             macro_df.index = pd.to_datetime(macro_df.index)
             if target_date in macro_df.index:
                 new_macro = macro_df.loc[[target_date]]
             else:
-                # Use the first row if target not present (should not happen)
                 new_macro = macro_df.iloc[[0]]
         new_macro.index = pd.to_datetime(new_macro.index)
 
-        # Append to base files
         # Align columns with existing files
         new_ohlcv_flat = new_ohlcv_flat.reindex(ohlcv.columns, fill_value=np.nan)
         new_macro = new_macro.reindex(macro.columns, fill_value=np.nan)
 
-        # Concatenate and sort (indices are datetime, so no error)
+        # Concatenate and convert indices to datetime
         ohlcv = pd.concat([ohlcv, new_ohlcv_flat], axis=0)
+        ohlcv.index = pd.to_datetime(ohlcv.index)  # ensure homogeneous
         ohlcv = ohlcv.sort_index()
         macro = pd.concat([macro, new_macro], axis=0)
+        macro.index = pd.to_datetime(macro.index)
         macro = macro.sort_index()
 
         # Upload base files
