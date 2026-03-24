@@ -2,9 +2,9 @@ name: Daily Dataset Update
 
 on:
   schedule:
-    # Run at a random minute between 22:00 and 23:00 UTC to spread load
+    # Run at 22:00 UTC Mon-Fri (after US market close)
     - cron: "0 22 * * 1-5"
-  workflow_dispatch:   # manual trigger
+  workflow_dispatch:   # manual trigger anytime
 
 jobs:
   update:
