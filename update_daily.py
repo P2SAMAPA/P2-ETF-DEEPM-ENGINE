@@ -30,7 +30,7 @@ def update_master() -> None:
         log.error("Base files missing. Run seed.py first.")
         sys.exit(1)
 
-    # Ensure indices are datetime
+    # Ensure indices are datetime (already done in load_parquet, but double‑check)
     ohlcv.index = pd.to_datetime(ohlcv.index)
     macro.index = pd.to_datetime(macro.index)
 
@@ -64,6 +64,7 @@ def update_master() -> None:
             new_macro = pd.DataFrame(index=[target_date], columns=cfg.FRED_SERIES.keys(), dtype=float)
         else:
             # Ensure we have exactly the target date
+            macro_df.index = pd.to_datetime(macro_df.index)
             if target_date in macro_df.index:
                 new_macro = macro_df.loc[[target_date]]
             else:
@@ -76,6 +77,7 @@ def update_master() -> None:
         new_ohlcv_flat = new_ohlcv_flat.reindex(ohlcv.columns, fill_value=np.nan)
         new_macro = new_macro.reindex(macro.columns, fill_value=np.nan)
 
+        # Concatenate and sort (indices are datetime, so no error)
         ohlcv = pd.concat([ohlcv, new_ohlcv_flat], axis=0)
         ohlcv = ohlcv.sort_index()
         macro = pd.concat([macro, new_macro], axis=0)
