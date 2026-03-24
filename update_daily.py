@@ -86,87 +86,116 @@ def hf_upload_parquet(df, filename, msg):
 
 def fetch_ohlcv_batch(tickers, start, end):
     """
-    Download OHLCV data for all tickers in a single batch request.
-    Uses group_by='ticker' to get MultiIndex columns, similar to the working script.
-    Retries with exponential backoff if rate‑limited.
+    Fetch data day by day to reduce the amount of data per request.
+    For each trading day in the range, download all tickers in one batch.
     """
-    log.info(f"Batch downloading {len(tickers)} tickers from {start} to {end}")
+    start_date = pd.to_datetime(start)
+    end_date = pd.to_datetime(end)
+    date_range = pd.date_range(start_date, end_date, freq='D')
+    if len(date_range) == 0:
+        return pd.DataFrame()
 
-    # Add a small random delay before the first request
-    time.sleep(random.uniform(1, 3))
+    log.info(f"Fetching {len(tickers)} tickers for {len(date_range)} day(s)")
 
-    for attempt in range(5):  # up to 5 attempts
-        try:
-            # Download with group_by='ticker' to preserve ticker‑field structure
-            raw = yf.download(
-                tickers,
-                start=start,
-                end=end,
-                auto_adjust=False,          # keep original OHLCV fields
-                progress=False,
-                group_by='ticker',
-                threads=True,
-            )
+    all_frames = []
+    for target_date in tqdm(date_range, desc="Days"):
+        target_str = target_date.strftime('%Y-%m-%d')
+        # Random delay between days to spread load
+        if len(all_frames) > 0:
+            delay = random.uniform(2, 5)
+            log.debug(f"Waiting {delay:.2f}s before next day")
+            time.sleep(delay)
 
-            if raw.empty:
-                log.warning(f"Batch attempt {attempt+1}: empty data")
-                if attempt < 4:
-                    wait = (2 ** attempt) * 5 + random.uniform(0, 2)
-                    log.info(f"Retrying in {wait:.2f}s...")
-                    time.sleep(wait)
-                continue
+        success = False
+        for attempt in range(3):  # up to 3 attempts per day
+            try:
+                # Request a small range (2 days before, 1 after) to ensure we get the target day
+                start_range = (target_date - timedelta(days=2)).strftime('%Y-%m-%d')
+                end_range = (target_date + timedelta(days=1)).strftime('%Y-%m-%d')
 
-            # Ensure MultiIndex columns (handles single ticker case)
-            if len(tickers) == 1:
-                # yfinance returns flat columns for a single ticker
-                ticker = tickers[0]
-                # Create MultiIndex: (ticker, field)
-                raw.columns = pd.MultiIndex.from_tuples(
-                    [(ticker, col) for col in raw.columns]
+                raw = yf.download(
+                    tickers,
+                    start=start_range,
+                    end=end_range,
+                    auto_adjust=False,
+                    progress=False,
+                    group_by='ticker',
+                    threads=True,
                 )
 
-            # Keep only OHLCV fields
-            valid_cols = [col for col in raw.columns if col[1] in OHLCV_FIELDS]
-            raw = raw[valid_cols]
+                if raw.empty:
+                    log.warning(f"Day {target_str}: empty download (attempt {attempt+1})")
+                    if attempt < 2:
+                        wait = (2 ** attempt) * 5 + random.uniform(0, 2)
+                        log.info(f"Retrying in {wait:.2f}s")
+                        time.sleep(wait)
+                    continue
 
-            # Convert to our flat format: columns like "ticker_Open"
-            frames = []
-            for ticker in tickers:
-                if ticker in raw.columns.get_level_values(0):
-                    df_ticker = raw[ticker].copy()
-                    df_ticker.columns = [f"{ticker}_{c}" for c in df_ticker.columns]
-                    frames.append(df_ticker)
+                # Handle single ticker case
+                if len(tickers) == 1:
+                    raw.columns = pd.MultiIndex.from_tuples([(tickers[0], col) for col in raw.columns])
 
-            if not frames:
-                log.warning("No valid OHLCV data after filtering")
-                if attempt < 4:
+                # Filter to the exact target date
+                mask = raw.index.date == target_date.date()
+                day_data = raw[mask]
+                if day_data.empty:
+                    log.warning(f"Day {target_str}: no data after date filter (attempt {attempt+1})")
+                    if attempt < 2:
+                        wait = (2 ** attempt) * 5 + random.uniform(0, 2)
+                        time.sleep(wait)
+                    continue
+
+                # Keep OHLCV fields
+                valid_cols = [col for col in day_data.columns if col[1] in OHLCV_FIELDS]
+                day_data = day_data[valid_cols]
+                if day_data.empty:
+                    log.warning(f"Day {target_str}: no OHLCV fields (attempt {attempt+1})")
+                    if attempt < 2:
+                        wait = (2 ** attempt) * 5 + random.uniform(0, 2)
+                        time.sleep(wait)
+                    continue
+
+                # Convert to flat columns (ticker_Open, ...)
+                frames = []
+                for t in tickers:
+                    if t in day_data.columns.get_level_values(0):
+                        df_t = day_data[t].copy()
+                        df_t.columns = [f"{t}_{c}" for c in df_t.columns]
+                        frames.append(df_t)
+
+                if not frames:
+                    log.warning(f"Day {target_str}: no ticker data (attempt {attempt+1})")
+                    if attempt < 2:
+                        wait = (2 ** attempt) * 5 + random.uniform(0, 2)
+                        time.sleep(wait)
+                    continue
+
+                day_combined = pd.concat(frames, axis=1)
+                day_combined.index = pd.to_datetime(day_combined.index)
+                if day_combined.index.tz is not None:
+                    day_combined.index = day_combined.index.tz_localize(None)
+                all_frames.append(day_combined)
+                success = True
+                break  # success for this day
+
+            except Exception as e:
+                log.warning(f"Day {target_str}: error on attempt {attempt+1}: {e}")
+                if attempt < 2:
                     wait = (2 ** attempt) * 5 + random.uniform(0, 2)
-                    log.info(f"Retrying in {wait:.2f}s...")
+                    log.info(f"Retrying in {wait:.2f}s")
                     time.sleep(wait)
-                continue
 
-            ohlcv = pd.concat(frames, axis=1).sort_index()
-            ohlcv.index = pd.to_datetime(ohlcv.index)
-            if ohlcv.index.tz is not None:
-                ohlcv.index = ohlcv.index.tz_localize(None)
-            ohlcv.index.name = "Date"
-            log.info(f"OHLCV shape: {ohlcv.shape} | date range: {ohlcv.index[0].date()} to {ohlcv.index[-1].date()}")
-            return ohlcv
+        if not success:
+            log.error(f"Failed to fetch data for {target_str} after retries")
 
-        except Exception as e:
-            log.error(f"Batch download error on attempt {attempt+1}: {e}")
-            if "Rate limit" in str(e) or "Too Many Requests" in str(e):
-                # Longer cooldown for rate limits
-                cooldown = random.uniform(30, 60)
-                log.warning(f"Rate limited – sleeping {cooldown:.0f}s")
-                time.sleep(cooldown)
-            elif attempt < 4:
-                wait = (2 ** attempt) * 10 + random.uniform(0, 5)
-                log.info(f"Retrying in {wait:.2f}s...")
-                time.sleep(wait)
+    if not all_frames:
+        log.warning("No data downloaded for any day")
+        return pd.DataFrame()
 
-    log.warning("All batch attempts failed")
-    return pd.DataFrame()
+    ohlcv = pd.concat(all_frames, axis=0).sort_index()
+    ohlcv.index.name = "Date"
+    log.info(f"OHLCV shape: {ohlcv.shape} | date range: {ohlcv.index[0].date()} to {ohlcv.index[-1].date()}")
+    return ohlcv
 
 
 def compute_returns(ohlcv):
