@@ -5,6 +5,7 @@
 import os
 import sys
 import logging
+import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 
@@ -51,11 +52,18 @@ def update_master() -> None:
             sys.exit(1)
         new_ohlcv_flat = du.flatten_ohlcv(ohlcv_multi)
 
-        # Fetch new FRED macro data for the same date
-        new_macro = du.download_fred(start=start, end=end)
-        if new_macro.empty:
+        # Fetch new FRED macro data for the same day (only the target date, not +1)
+        macro_df = du.download_fred(start=start, end=start)   # single day
+        if macro_df.empty:
             log.warning("FRED data not available; using NaNs.")
             new_macro = pd.DataFrame(index=[target_date], columns=cfg.FRED_SERIES.keys(), dtype=float)
+        else:
+            # macro_df may have index of trading days; we want the row for target_date
+            # Ensure it's a single row
+            if len(macro_df) > 1:
+                # Should not happen with start=end, but just in case, keep only the target
+                macro_df = macro_df[macro_df.index == target_date]
+            new_macro = macro_df.iloc[[0]] if not macro_df.empty else pd.DataFrame(index=[target_date], columns=cfg.FRED_SERIES.keys(), dtype=float)
 
         # Append to base files
         # Align columns with existing files
