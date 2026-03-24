@@ -5,3 +5,4 @@ pyarrow
 plotly
 huggingface_hub
 altair>=5.0.0
+pandas_market_calendars
