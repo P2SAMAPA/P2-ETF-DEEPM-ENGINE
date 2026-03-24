@@ -1,331 +1,232 @@
-"""
-update_daily.py — P2-ETF-DEEPM-ENGINE
-Daily incremental data update.
-Loads existing dataset from HF, fetches only new trading days,
-rebuilds master, pushes back to HF.
-"""
-import io
+#!/usr/bin/env python
+# update_daily.py — P2-ETF-DEEPM-ENGINE
+# Daily incremental update: fetches OHLCV for all tickers and macro data
+# for the last trading day and appends to the HuggingFace dataset.
+
 import os
+import sys
 import time
 import random
 import logging
-from datetime import datetime, timedelta
-
 import numpy as np
 import pandas as pd
+from datetime import datetime, timedelta
+from huggingface_hub import HfApi, hf_hub_download, upload_file
 import yfinance as yf
-from fredapi import Fred
-from huggingface_hub import HfApi, hf_hub_download
-from tqdm import tqdm
+import requests
+import pandas_market_calendars as mcal
+
+import config as cfg
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-HF_TOKEN        = os.environ.get("HF_TOKEN", "")
-HF_DATASET_REPO = os.environ.get("HF_DATASET_REPO", "P2SAMAPA/p2-etf-deepm-data")
-FRED_API_KEY    = os.environ.get("FRED_API_KEY", "")
 
-ALL_TICKERS = [
-    "AGG", "GDX", "GLD", "HYG", "LQD", "MBB", "PFF",
-    "QQQ", "SLV", "SPY", "TLT", "VNQ",
-    "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY", "XME",
-]
-
-FRED_SERIES = {
-    "VIX":        "VIXCLS",
-    "T10Y2Y":     "T10Y2Y",
-    "HY_SPREAD":  "BAMLH0A0HYM2",
-    "USD_INDEX":  "DTWEXBGS",
-    "DTB3":       "DTB3",
-    "T10YIE":     "T10YIE",
-    "UNRATE":     "UNRATE",
-    "CPIAUCSL":   "CPIAUCSL",
-    "FEDFUNDS":   "FEDFUNDS",
-    "INDPRO":     "INDPRO",
-    "HOUST":      "HOUST",
-    "PAYEMS":     "PAYEMS",
-    "WTI":        "DCOILWTICO",
-    "BAMLC0A0CM": "BAMLC0A0CM",
-}
-
-OHLCV_FIELDS = ["Open", "High", "Low", "Close", "Volume"]
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
+def next_trading_day(date: pd.Timestamp) -> pd.Timestamp:
+    """Return the next NYSE trading day after the given date."""
+    nyse = mcal.get_calendar("NYSE")
+    schedule = nyse.schedule(start_date=date, end_date=date + pd.Timedelta(days=10))
+    trading_days = schedule.index
+    next_days = trading_days[trading_days > date]
+    if len(next_days) > 0:
+        return next_days[0]
+    # fallback: skip weekends only
+    d = date + pd.Timedelta(days=1)
+    while d.weekday() >= 5:
+        d += pd.Timedelta(days=1)
+    return d
 
 
-def hf_load_parquet(filename):
-    path = hf_hub_download(
-        repo_id=HF_DATASET_REPO,
-        filename=f"data/{filename}",
-        repo_type="dataset",
-        token=HF_TOKEN or None,
-        force_download=True,
-    )
-    df = pd.read_parquet(path)
-    if "Date" in df.columns:
-        df = df.set_index("Date")
-    df.index = pd.to_datetime(df.index)
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-    return df.sort_index()
-
-
-def hf_upload_parquet(df, filename, msg):
-    api = HfApi(token=HF_TOKEN)
-    buf = io.BytesIO()
-    df.to_parquet(buf)
-    buf.seek(0)
-    api.upload_file(
-        path_or_fileobj=buf,
-        path_in_repo=f"data/{filename}",
-        repo_id=HF_DATASET_REPO,
-        repo_type="dataset",
-        commit_message=msg,
-    )
-    log.info(f"Uploaded {filename}")
-
-
-def fetch_ohlcv_batch(tickers, start, end):
+def fetch_ticker_batch(tickers: list, target_date: pd.Timestamp,
+                       retries: int = 3, backoff_factor: float = 2.0) -> pd.DataFrame:
     """
-    Fetch data day by day with large delays between days and very long cooldowns on rate limits.
-    This is intentionally slow to avoid being blocked.
+    Fetch OHLCV for a batch of tickers for a single date.
+    Implements exponential backoff with jitter for rate‑limit errors.
+    Returns DataFrame with columns like TICKER_Open, TICKER_High, ...
     """
-    start_date = pd.to_datetime(start)
-    end_date = pd.to_datetime(end)
-    date_range = pd.date_range(start_date, end_date, freq='D')
-    if len(date_range) == 0:
-        return pd.DataFrame()
+    start = target_date - timedelta(days=5)
+    end   = target_date + timedelta(days=1)
 
-    log.info(f"Fetching {len(tickers)} tickers for {len(date_range)} day(s) (very slow mode)")
-
-    all_frames = []
-    for idx, target_date in enumerate(date_range):
-        target_str = target_date.strftime('%Y-%m-%d')
-        log.info(f"Processing day {idx+1}/{len(date_range)}: {target_str}")
-
-        success = False
-        for attempt in range(3):  # up to 3 attempts per day
-            try:
-                # Long delay before each day's request (10–20 seconds)
-                if idx > 0 or attempt > 0:
-                    delay = random.uniform(10, 20)
-                    log.debug(f"Waiting {delay:.2f}s before request")
-                    time.sleep(delay)
-
-                # Request a small window around the target date to ensure we get the data
-                start_range = (target_date - timedelta(days=2)).strftime('%Y-%m-%d')
-                end_range = (target_date + timedelta(days=1)).strftime('%Y-%m-%d')
-
-                raw = yf.download(
-                    tickers,
-                    start=start_range,
-                    end=end_range,
-                    auto_adjust=False,
-                    progress=False,
-                    group_by='ticker',
-                    threads=False,          # no threading to keep it simple
-                )
-
-                if raw.empty:
-                    log.warning(f"Day {target_str}: empty download (attempt {attempt+1})")
-                    continue
-
-                # Handle single ticker case
-                if len(tickers) == 1:
-                    raw.columns = pd.MultiIndex.from_tuples([(tickers[0], col) for col in raw.columns])
-
-                # Filter to exact target date
-                mask = raw.index.date == target_date.date()
-                day_data = raw[mask]
-                if day_data.empty:
-                    log.warning(f"Day {target_str}: no data after date filter (attempt {attempt+1})")
-                    continue
-
-                # Keep OHLCV fields
-                valid_cols = [col for col in day_data.columns if col[1] in OHLCV_FIELDS]
-                day_data = day_data[valid_cols]
-                if day_data.empty:
-                    log.warning(f"Day {target_str}: no OHLCV fields (attempt {attempt+1})")
-                    continue
-
-                # Convert to flat columns
-                frames = []
-                for t in tickers:
-                    if t in day_data.columns.get_level_values(0):
-                        df_t = day_data[t].copy()
-                        df_t.columns = [f"{t}_{c}" for c in df_t.columns]
-                        frames.append(df_t)
-
-                if not frames:
-                    log.warning(f"Day {target_str}: no ticker data (attempt {attempt+1})")
-                    continue
-
-                day_combined = pd.concat(frames, axis=1)
-                day_combined.index = pd.to_datetime(day_combined.index)
-                if day_combined.index.tz is not None:
-                    day_combined.index = day_combined.index.tz_localize(None)
-                all_frames.append(day_combined)
-                success = True
-                log.info(f"Day {target_str}: fetched {len(day_combined.columns)} columns")
-                break
-
-            except Exception as e:
-                log.error(f"Day {target_str}: error on attempt {attempt+1}: {e}")
-                if "Rate limit" in str(e) or "Too Many Requests" in str(e):
-                    # Long cooldown for rate limits (2–5 minutes)
-                    cooldown = random.uniform(120, 300)
-                    log.warning(f"Rate limit detected – sleeping {cooldown:.0f}s")
-                    time.sleep(cooldown)
-                elif attempt < 2:
-                    wait = random.uniform(30, 60)   # generic error wait
-                    log.info(f"Retrying in {wait:.2f}s")
-                    time.sleep(wait)
-
-        if not success:
-            log.error(f"Day {target_str}: failed after retries – skipping")
-            # We could decide to stop entirely, but we'll skip this day
-
-    if not all_frames:
-        log.warning("No data downloaded for any day")
-        return pd.DataFrame()
-
-    ohlcv = pd.concat(all_frames, axis=0).sort_index()
-    ohlcv.index.name = "Date"
-    log.info(f"OHLCV shape: {ohlcv.shape} | date range: {ohlcv.index[0].date()} to {ohlcv.index[-1].date()}")
-    return ohlcv
-
-
-def compute_returns(ohlcv):
-    frames = {}
-    for t in ALL_TICKERS:
-        col = f"{t}_Close"
-        if col in ohlcv.columns:
-            s = ohlcv[col]
-            frames[f"{t}_ret"]    = s.pct_change()
-            frames[f"{t}_logret"] = np.log(s / s.shift(1))
-    return pd.DataFrame(frames, index=ohlcv.index).dropna(how="all")
-
-
-def compute_vol(ohlcv, windows=(5, 21, 63)):
-    frames = {}
-    for t in ALL_TICKERS:
-        col = f"{t}_Close"
-        if col in ohlcv.columns:
-            lr = np.log(ohlcv[col] / ohlcv[col].shift(1))
-            for w in windows:
-                frames[f"{t}_vol{w}"] = lr.rolling(w).std() * np.sqrt(252)
-    return pd.DataFrame(frames, index=ohlcv.index).dropna(how="all")
-
-
-def fetch_macro(start, end):
-    if not FRED_API_KEY:
-        log.warning("No FRED_API_KEY — skipping macro")
-        return pd.DataFrame()
-    fred = Fred(api_key=FRED_API_KEY)
-    frames = {}
-    for name, sid in FRED_SERIES.items():
+    for attempt in range(1, retries + 1):
         try:
-            s = fred.get_series(sid, observation_start=start, observation_end=end)
-            s.index = pd.to_datetime(s.index)
-            if s.index.tz is not None:
-                s.index = s.index.tz_localize(None)
-            frames[name] = s
+            raw = yf.download(tickers, start=start, end=end,
+                              auto_adjust=True, progress=False, threads=False)
+            if raw.empty:
+                raise ValueError("Empty download")
+            # Convert multi‑index to flat
+            if isinstance(raw.columns, pd.MultiIndex):
+                flat = pd.DataFrame()
+                for t in tickers:
+                    for col in cfg.OHLCV_COLS:
+                        if (col, t) in raw.columns:
+                            flat[f"{t}_{col}"] = raw[(col, t)]
+                        else:
+                            flat[f"{t}_{col}"] = np.nan
+                flat.index = raw.index
+            else:
+                flat = raw.copy()
+                for col in cfg.OHLCV_COLS:
+                    flat.rename(columns={col: f"{tickers[0]}_{col}"}, inplace=True)
+            # Get the row for target_date
+            if target_date not in flat.index:
+                # Try the most recent date <= target_date
+                dates = flat.index[flat.index <= target_date]
+                if len(dates) == 0:
+                    raise ValueError(f"No data on or before {target_date}")
+                actual_date = dates[-1]
+                row = flat.loc[actual_date]
+            else:
+                row = flat.loc[target_date]
+            return row
         except Exception as e:
-            log.warning(f"  FRED {name}: {e}")
-    if not frames:
-        return pd.DataFrame()
-    df = pd.DataFrame(frames)
-    df.index.name = "Date"
-    return df.ffill().sort_index()
+            if attempt == retries:
+                log.error(f"Batch {tickers} failed after {retries} attempts: {e}")
+                raise
+            sleep_time = backoff_factor ** (attempt - 1) + random.uniform(0, 1)
+            log.warning(f"Batch {tickers} attempt {attempt} failed: {e}. Retrying in {sleep_time:.2f}s")
+            time.sleep(sleep_time)
 
 
-def build_master(ohlcv, returns, vol, macro):
-    common = ohlcv.index
-    for df in [returns, vol, macro]:
-        if not df.empty:
-            common = common.intersection(df.index)
-    common = common.sort_values()
-    parts = [ohlcv.reindex(common), returns.reindex(common)]
-    if not vol.empty:
-        parts.append(vol.reindex(common))
-    if not macro.empty:
-        parts.append(macro.reindex(common))
-    master = pd.concat(parts, axis=1).ffill()
-    master.index.name = "Date"
-    return master
+def fetch_all_etfs(target_date: pd.Timestamp, batch_size: int = 5) -> pd.Series:
+    """
+    Fetch OHLCV for all ETFs and benchmarks, in batches.
+    Returns a Series indexed by column name (e.g., TLT_Close).
+    """
+    all_tickers = cfg.ALL_TICKERS
+    batches = [all_tickers[i:i+batch_size] for i in range(0, len(all_tickers), batch_size)]
+
+    rows = []
+    for i, batch in enumerate(batches):
+        log.info(f"Fetching batch {i+1}/{len(batches)}: {batch}")
+        try:
+            row = fetch_ticker_batch(batch, target_date)
+            rows.append(row)
+        except Exception as e:
+            log.error(f"Batch {batch} failed: {e}")
+            # Continue with other batches (maybe some tickers can be fetched later)
+        # Pause between batches to avoid rate limits
+        time.sleep(random.uniform(1.0, 2.0))
+
+    if not rows:
+        raise ValueError("No data fetched for any ticker")
+
+    # Combine all rows (each is a Series)
+    combined = pd.concat(rows, axis=0)
+    return combined
 
 
-def main():
+def fetch_fred_data(target_date: pd.Timestamp) -> pd.Series:
+    """Fetch all FRED series for the target date."""
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    data = {}
+    for series_id, desc in cfg.FRED_SERIES.items():
+        params = {
+            "series_id": series_id,
+            "api_key": cfg.FRED_API_KEY,
+            "file_type": "json",
+            "observation_start": target_date.strftime("%Y-%m-%d"),
+            "observation_end":   target_date.strftime("%Y-%m-%d"),
+        }
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            obs = r.json().get("observations", [])
+            if obs:
+                data[series_id] = float(obs[0]["value"])
+            else:
+                data[series_id] = np.nan
+        except Exception as e:
+            log.warning(f"FRED {series_id} failed: {e}")
+            data[series_id] = np.nan
+        time.sleep(0.3)  # respectful pacing
+    return pd.Series(data, name=target_date)
+
+
+def update_master() -> None:
+    """Main incremental update."""
     log.info("=" * 60)
-    log.info(f"P2-ETF-DEEPM DAILY UPDATE — {datetime.utcnow().strftime('%Y-%m-%d')}")
+    log.info(f"P2-ETF-DEEPM DAILY UPDATE — {datetime.now().strftime('%Y-%m-%d')}")
     log.info("=" * 60)
 
-    if not HF_TOKEN:
-        log.error("HF_TOKEN not set")
-        raise SystemExit(1)
-
-    log.info("Loading existing master from HuggingFace...")
+    # Load existing master
     try:
-        master_existing = hf_load_parquet("master.parquet")
-        last_date = master_existing.index.max()
-        log.info(f"Last stored: {last_date.date()} | rows: {len(master_existing)}")
+        master_path = hf_hub_download(
+            repo_id=cfg.HF_DATASET_REPO,
+            filename=cfg.FILE_MASTER,
+            repo_type="dataset",
+            token=cfg.HF_TOKEN,
+            local_dir="/tmp",
+            local_dir_use_symlinks=False,
+        )
+        master = pd.read_parquet(master_path)
+        master.index = pd.to_datetime(master.index)
+        last_date = master.index[-1]
+        log.info(f"Last stored: {last_date.date()} | rows: {len(master)}")
     except Exception as e:
-        log.error(f"Cannot load master from HF: {e}")
-        raise SystemExit(1)
+        log.error(f"Failed to load master: {e}")
+        sys.exit(1)
 
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
-    start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    if start > today_str:
-        log.info("Already up to date. Nothing to do.")
+    # Determine next trading day to update
+    next_td = next_trading_day(last_date)
+    if next_td.date() > datetime.now().date():
+        log.info("Next trading day is in the future – nothing to update.")
         return
 
-    log.info(f"Update window: {start} to {today_str}")
+    target_date = next_td
+    log.info(f"Update window: {target_date.date()} to {target_date.date()}")
 
-    new_ohlcv = fetch_ohlcv_batch(ALL_TICKERS, start=start, end=today_str)
-    if new_ohlcv.empty:
-        log.warning("No new OHLCV data after all retries — market closed or YF unavailable.")
-        log.warning("Skipping update. Will retry tomorrow.")
-        return
-
-    log.info(f"New days: {len(new_ohlcv)} | {list(new_ohlcv.index.date)}")
-
-    log.info("Loading component files from HF...")
+    # Fetch new OHLCV
     try:
-        ohlcv_existing = hf_load_parquet("etf_ohlcv.parquet")
-        macro_existing = hf_load_parquet("macro_fred.parquet")
+        etf_row = fetch_all_etfs(target_date)
     except Exception as e:
-        log.error(f"Failed to load component files: {e}")
-        raise SystemExit(1)
+        log.error(f"OHLCV fetch failed: {e}")
+        sys.exit(1)
 
-    ohlcv = pd.concat([ohlcv_existing, new_ohlcv])
-    ohlcv = ohlcv[~ohlcv.index.duplicated(keep="last")].sort_index()
+    # Fetch new FRED data
+    try:
+        fred_row = fetch_fred_data(target_date)
+    except Exception as e:
+        log.error(f"FRED fetch failed: {e}")
+        sys.exit(1)
 
-    returns = compute_returns(ohlcv)
-    vol     = compute_vol(ohlcv)
+    # Combine into a single row (same columns as master)
+    new_row = pd.Series(index=master.columns, dtype=float)
+    # Copy OHLCV columns
+    for col in etf_row.index:
+        if col in master.columns:
+            new_row[col] = etf_row[col]
+    # Copy FRED columns
+    for col in fred_row.index:
+        if col in master.columns:
+            new_row[col] = fred_row[col]
 
-    fred_start = (last_date - timedelta(days=5)).strftime("%Y-%m-%d")
-    new_macro  = fetch_macro(start=fred_start, end=today_str)
-    if not new_macro.empty:
-        macro = pd.concat([macro_existing, new_macro])
-        macro = macro[~macro.index.duplicated(keep="last")].sort_index().ffill()
-    else:
-        macro = macro_existing
+    # Append to master
+    new_row.name = target_date
+    master = master.append(new_row).sort_index()
 
-    master = build_master(ohlcv, returns, vol, macro)
-
-    log.info("Uploading to HuggingFace...")
-    hf_upload_parquet(ohlcv,   "etf_ohlcv.parquet",   f"[update] OHLCV to {today_str}")
-    hf_upload_parquet(returns, "etf_returns.parquet",  f"[update] returns to {today_str}")
-    hf_upload_parquet(macro,   "macro_fred.parquet",   f"[update] macro to {today_str}")
-    hf_upload_parquet(master,  "master.parquet",       f"[update] master to {today_str}")
-
-    log.info("=" * 60)
-    log.info("UPDATE COMPLETE")
-    log.info(f"  New days  : {len(new_ohlcv)}")
-    log.info(f"  Latest    : {master.index[-1].date()}")
-    log.info(f"  Total rows: {len(master)}")
-    log.info("=" * 60)
+    # Save locally and upload
+    tmp_path = "/tmp/master.parquet"
+    master.to_parquet(tmp_path)
+    api = HfApi(token=cfg.HF_TOKEN)
+    api.upload_file(
+        path_or_fileobj=tmp_path,
+        path_in_repo=cfg.FILE_MASTER,
+        repo_id=cfg.HF_DATASET_REPO,
+        repo_type="dataset",
+        commit_message=f"Daily update: added {target_date.date()}",
+    )
+    log.info(f"Updated master with {target_date.date()}")
 
 
 if __name__ == "__main__":
-    main()
+    if not cfg.HF_TOKEN:
+        log.error("HF_TOKEN not set")
+        sys.exit(1)
+    if not cfg.FRED_API_KEY:
+        log.error("FRED_API_KEY not set")
+        sys.exit(1)
+    update_master()
