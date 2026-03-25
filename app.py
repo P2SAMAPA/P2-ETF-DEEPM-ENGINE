@@ -11,7 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from huggingface_hub import hf_hub_download
-import pandas_market_calendars as mcal   # <-- added for next trading day
+import pandas_market_calendars as mcal
 
 import config as cfg
 
@@ -210,23 +210,6 @@ def build_bt(signal: dict, master: pd.DataFrame, option: str,
     }
 
 
-def best_signal(sig_fixed: dict, sig_window: dict) -> tuple:
-    """
-    Return (best_signal, source_label) where best = higher OOS ann return.
-    Fixed split uses test_ann_return; shrinking window uses oos_ann_return.
-    If conviction is very low (<20%) on both, flags it.
-    """
-    ret_fixed  = sig_fixed.get("test_ann_return",  -999) if sig_fixed else -999
-    ret_window = sig_window.get("oos_ann_return",   -999) if sig_window else -999
-
-    if ret_window > ret_fixed and sig_window and "pick" in sig_window:
-        return sig_window, "Shrinking Window"
-    elif sig_fixed and "pick" in sig_fixed:
-        return sig_fixed, "Fixed Split"
-    else:
-        return sig_fixed or sig_window or {}, "—"
-
-
 def conviction_warning(signal: dict) -> str:
     """Return warning text if model conviction is low (weights nearly flat)."""
     if not signal or "weights" not in signal:
@@ -246,18 +229,23 @@ def pill(label, val, lo, hi):
     return f'<span class="pill {cls}">{label}: {val}</span>'
 
 
-def render_hero(sig_fixed: dict, sig_window: dict, option: str):
-    best, source = best_signal(sig_fixed, sig_window)
-
-    if not best or "pick" not in best:
+def render_hero(best_signal: dict, source: str, master: pd.DataFrame):
+    """Display hero card for the best signal."""
+    if not best_signal or "pick" not in best_signal:
         st.info("Signal not available yet — run the training workflow first.")
         return
 
-    tickers     = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
-    label_names = tickers  # no CASH
-    w           = best.get("weights", {})
+    # Compute the correct next trading day from the latest data in master
+    if master.empty:
+        next_day = "unknown"
+    else:
+        last_data_date = master.index[-1]
+        next_day = next_trading_day(last_data_date).strftime("%Y-%m-%d")
+
+    tickers     = cfg.FI_ETFS if best_signal.get("option") == "A" else cfg.EQ_ETFS
+    w           = best_signal.get("weights", {})
     picks       = sorted(
-        [(t, w.get(t, 0.0)) for t in label_names],
+        [(t, w.get(t, 0.0)) for t in tickers],
         key=lambda x: x[1], reverse=True,
     )
 
@@ -265,20 +253,7 @@ def render_hero(sig_fixed: dict, sig_window: dict, option: str):
     t2 = picks[1] if len(picks) > 1 else None
     t3 = picks[2] if len(picks) > 2 else None
 
-    # --- Date handling: prefer signal_date, else compute from last_data_date ---
-    sig_date = best.get("signal_date")
-    if not sig_date:
-        last_date_str = best.get("last_data_date")
-        if last_date_str:
-            try:
-                last_date = pd.Timestamp(last_date_str)
-                sig_date = next_trading_day(last_date).strftime("%Y-%m-%d")
-            except Exception:
-                sig_date = "unknown"
-        else:
-            sig_date = "unknown"
-
-    gen      = best.get("generated_at", "")
+    gen = best_signal.get("generated_at", "")
     try:
         gen = datetime.fromisoformat(gen).strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
@@ -288,22 +263,22 @@ def render_hero(sig_fixed: dict, sig_window: dict, option: str):
     if t2: runner += f"<span style='color:#6b7280'>2nd:</span> <b>{t2[0]}</b> {t2[1]*100:.1f}%"
     if t3: runner += f"&nbsp;&nbsp;<span style='color:#6b7280'>3rd:</span> <b>{t3[0]}</b> {t3[1]*100:.1f}%"
 
-    rc  = best.get("regime_context", {})
-    st_ = best.get("macro_stress")
+    rc  = best_signal.get("regime_context", {})
+    st_ = best_signal.get("macro_stress")
     pills = ""
     if rc.get("VIX"):              pills += pill("VIX",    rc["VIX"],    15,   25)
     if rc.get("T10Y2Y") is not None: pills += pill("T10Y2Y", rc["T10Y2Y"], -0.5, 0.5)
     if rc.get("HY_SPREAD"):        pills += pill("HY Spr", rc["HY_SPREAD"], 300, 500)
     if st_ is not None:            pills += pill("Stress",  st_,          -0.5, 0.5)
 
-    warn = conviction_warning(best)
+    warn = conviction_warning(best_signal)
     warn_html = f"<div style='margin-top:10px;font-size:14px;color:#92400e;background:#fef3c7;padding:8px 14px;border-radius:8px;'>{warn}</div>" if warn else ""
 
     st.markdown(f"""
     <div class="hero-card">
       <div class="hero-ticker">{t1[0]}</div>
       <div class="hero-conv">{t1[1]*100:.1f}% conviction</div>
-      <div class="hero-date">Signal for {sig_date} &nbsp;·&nbsp; Generated {gen}</div>
+      <div class="hero-date">Signal for {next_day} &nbsp;·&nbsp; Generated {gen}</div>
       <div class="hero-source">Source: {source}</div>
       <div class="runner-up">{runner}</div>
       <div style="margin-top:16px">{pills}</div>
@@ -415,12 +390,10 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame, best_sig: dict =
         best_date = best_sig["signal_date"]
         best_pick = best_sig["pick"]
         best_conv = best_sig["conviction"]
-        # Update matching row or append
         mask = hist_df["signal_date"] == best_date
         if mask.any():
             hist_df.loc[mask, "pick"]       = best_pick
             hist_df.loc[mask, "conviction"] = best_conv
-        # If not found, history already has it from predict.py
 
     if "actual_return" not in hist_df.columns and not master.empty:
         def get_ret(row):
@@ -477,14 +450,11 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame, best_sig: dict =
 # ── Option renderer ────────────────────────────────────────────────────────────
 
 def render_option(option: str, signals: dict, master: pd.DataFrame):
-    sig  = signals.get(option,         {})
-    sigw = signals.get(f"{option}w",   {})
+    sig_fixed  = signals.get(option,         {})
+    sig_window = signals.get(f"{option}w",   {})
     hist = load_history(option)
 
-    # Hero — best of fixed split vs shrinking window
-    render_hero(sig, sigw, option)
-
-    # Compute fixed split test start date from actual data
+    # Compute backtest curves for both signals (needed for selection and panels)
     n_total     = len(master) if not master.empty else 4582
     n_test      = int(n_total * (1 - cfg.TRAIN_SPLIT - cfg.VAL_SPLIT))
     test_start  = str(master.index[-n_test].date()) if not master.empty else "~2021"
@@ -492,19 +462,26 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
     oos_start   = cfg.LIVE_START
     oos_end     = test_end
 
-    # Side by side performance panels
+    bt_f = build_bt(sig_fixed, master, option, start_date=test_start)
+    bt_w = build_bt(sig_window, master, option, start_date=cfg.LIVE_START)
+
+    # Determine which signal performed better in the backtest (using annual return)
+    # If a signal is missing, treat its return as -inf
+    ret_f = bt_f["m"]["ar"] if bt_f else -float("inf")
+    ret_w = bt_w["m"]["ar"] if bt_w else -float("inf")
+
+    if ret_w > ret_f:
+        best_signal = sig_window
+        best_source = "Shrinking Window"
+    else:
+        best_signal = sig_fixed
+        best_source = "Fixed Split"
+
+    # Hero (now uses computed best and the master for date)
+    render_hero(best_signal, best_source, master)
+
+    # Performance panels
     col_f, col_w = st.columns(2, gap="large")
-
-    bt_f = build_bt(sig,  master, option, start_date=test_start)
-    bt_w = build_bt(sigw, master, option, start_date=cfg.LIVE_START)
-
-    # Compute correct test period for fixed split
-    n_total    = len(master) if not master.empty else 4582
-    n_test     = int(n_total * (1 - cfg.TRAIN_SPLIT - cfg.VAL_SPLIT))
-    test_start = str(master.index[-n_test].date()) if not master.empty else "~2021"
-    test_end   = str(master.index[-1].date()) if not master.empty else "today"
-    oos_start  = cfg.LIVE_START
-    oos_end    = test_end
 
     with col_f:
         st.markdown("<div class='label-fixed'>Fixed Split (70/15/15)</div>",
@@ -517,15 +494,15 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
         )
         render_metrics(bt_f)
         render_curve(bt_f, key=f"{option}_fixed")
-        render_footnote(sig, window=False)
+        render_footnote(sig_fixed, window=False)
 
     with col_w:
         st.markdown("<div class='label-window'>Shrinking Window</div>",
                     unsafe_allow_html=True)
-        if sigw and "winning_window" in sigw:
+        if sig_window and "winning_window" in sig_window:
             st.markdown(
                 f"<div class='window-badge'>"
-                f"Train: {sigw.get('winning_train_start','?')} → {sigw.get('winning_train_end','?')}"
+                f"Train: {sig_window.get('winning_train_start','?')} → {sig_window.get('winning_train_end','?')}"
                 f" &nbsp;·&nbsp; OOS: {oos_start} → {oos_end}"
                 f"</div>",
                 unsafe_allow_html=True,
@@ -538,14 +515,12 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
             )
         render_metrics(bt_w)
         render_curve(bt_w, key=f"{option}_window")
-        render_footnote(sigw, window=True)
+        render_footnote(sig_window, window=True)
 
-    # Signal history — full width
-    # Use best signal pick for history display
-    best, source = best_signal(sig, sigw)
+    # Signal history
     st.markdown("<div class='sec-hdr'>Signal History</div>", unsafe_allow_html=True)
-    st.caption(f"Pick shown is from: {source}")
-    render_history(hist, master, best)
+    st.caption(f"Pick shown is from: {best_source}")
+    render_history(hist, master, best_signal)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
