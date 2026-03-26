@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 import torch
-from huggingface_hub import HfApi   # <-- added for upload
+from huggingface_hub import HfApi, hf_hub_download
 
 import config as cfg
 import loader
@@ -271,13 +271,28 @@ def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
 
 # ── History + save ─────────────────────────────────────────────────────────────
 
+def _load_remote_history(option: str) -> list:
+    """Download existing history from Hugging Face, if available."""
+    remote_path = f"models/signal_history_{option}.json"
+    try:
+        local_path = hf_hub_download(
+            repo_id=cfg.HF_DATASET_REPO,
+            filename=remote_path,
+            repo_type="dataset",
+            token=cfg.HF_TOKEN or None,
+            local_dir=cfg.MODELS_DIR,
+            local_dir_use_symlinks=False,
+        )
+        with open(local_path) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
 def update_signal_history(signal: dict, option: str) -> None:
-    """Append new signal to local history and upload to Hugging Face."""
-    history_path = os.path.join(cfg.MODELS_DIR, f"signal_history_{option}.json")
-    history = []
-    if os.path.exists(history_path):
-        with open(history_path) as f:
-            history = json.load(f)
+    """Append new signal to history, preserving existing records from HF."""
+    # Load existing history from HF
+    history = _load_remote_history(option)
 
     record = {
         "signal_date":   signal["signal_date"],
@@ -287,11 +302,17 @@ def update_signal_history(signal: dict, option: str) -> None:
         "actual_return": signal.get("actual_return"),
         "hit":           signal.get("hit"),
     }
+
+    # Avoid duplicates
     existing_dates = {r["signal_date"] for r in history}
     if record["signal_date"] not in existing_dates:
         history.append(record)
+        print(f"[predict] Appended new record for {record['signal_date']}")
+    else:
+        print(f"[predict] Record for {record['signal_date']} already exists – skipping")
 
     # Save locally
+    history_path = os.path.join(cfg.MODELS_DIR, f"signal_history_{option}.json")
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"[predict] History updated: {len(history)} records for Option {option}")
@@ -312,39 +333,73 @@ def update_signal_history(signal: dict, option: str) -> None:
         print(f"[predict] WARNING: Failed to upload history for Option {option}: {e}")
 
 
-def save_signals(
-    signal_A: dict = None,
-    signal_B: dict = None,
-    signal_A_window: dict = None,
-    signal_B_window: dict = None,
-) -> None:
+def best_signal(sig_fixed: dict, sig_window: dict) -> dict:
+    """Return whichever signal has higher OOS/test return."""
+    ret_f = sig_fixed.get("test_ann_return",  -999) if sig_fixed else -999
+    ret_w = sig_window.get("oos_ann_return",   -999) if sig_window else -999
+    return sig_window if (ret_w > ret_f and sig_window and "pick" in sig_window) \
+           else (sig_fixed or {})
+
+
+def save_signals(sig_A=None, sig_B=None, sig_Aw=None, sig_Bw=None):
     os.makedirs(cfg.MODELS_DIR, exist_ok=True)
 
     combined = {
         "generated_at":    datetime.utcnow().isoformat(),
-        "option_A":        signal_A,
-        "option_B":        signal_B,
-        "option_A_window": signal_A_window,
-        "option_B_window": signal_B_window,
+        "option_A":        sig_A,
+        "option_B":        sig_B,
+        "option_A_window": sig_Aw,
+        "option_B_window": sig_Bw,
     }
-    with open(os.path.join(cfg.MODELS_DIR, "latest_signals.json"), "w") as f:
+
+    local_combined = os.path.join(cfg.MODELS_DIR, "latest_signals.json")
+    with open(local_combined, "w") as f:
         json.dump(combined, f, indent=2)
     print(f"\n[predict] All signals saved.")
 
+    # Upload combined signals
+    try:
+        api = HfApi(token=cfg.HF_TOKEN)
+        with open(local_combined, "rb") as f:
+            api.upload_file(
+                path_or_fileobj=f,
+                path_in_repo="models/latest_signals.json",
+                repo_id=cfg.HF_DATASET_REPO,
+                repo_type="dataset",
+                commit_message=f"Update latest signals ({combined['generated_at']})"
+            )
+        print("[predict] Uploaded latest_signals.json")
+    except Exception as e:
+        print(f"[predict] WARNING: Failed to upload latest_signals.json: {e}")
+
+    # Upload individual signal files
     for sig, name, opt, update_hist in [
-        (signal_A,        "signal_A",        "A", True),
-        (signal_B,        "signal_B",        "B", True),
-        (signal_A_window, "signal_A_window", "A", False),
-        (signal_B_window, "signal_B_window", "B", False),
+        (sig_A,  "signal_A",        "A", True),
+        (sig_B,  "signal_B",        "B", True),
+        (sig_Aw, "signal_A_window", "A", False),
+        (sig_Bw, "signal_B_window", "B", False),
     ]:
         if sig:
-            with open(os.path.join(cfg.MODELS_DIR, f"{name}.json"), "w") as f:
+            local = os.path.join(cfg.MODELS_DIR, f"{name}.json")
+            with open(local, "w") as f:
                 json.dump(sig, f, indent=2)
+            try:
+                with open(local, "rb") as f:
+                    api.upload_file(
+                        path_or_fileobj=f,
+                        path_in_repo=f"models/{name}.json",
+                        repo_id=cfg.HF_DATASET_REPO,
+                        repo_type="dataset",
+                        token=cfg.HF_TOKEN,
+                        commit_message=f"Update {name} signal"
+                    )
+                print(f"[predict] Uploaded {name}.json")
+            except Exception as e:
+                print(f"[predict] WARNING: Failed to upload {name}.json: {e}")
+
             if update_hist:
                 update_signal_history(sig, opt)
 
-
-# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate DeePM daily signals")
