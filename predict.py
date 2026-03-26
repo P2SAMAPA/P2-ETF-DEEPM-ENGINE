@@ -38,6 +38,23 @@ def next_trading_day(from_date: str = None) -> str:
     return str(future[0].date()) if future else str((base + pd.Timedelta(days=1)).date())
 
 
+def _get_actual_return(pick: str, signal_date: str, master: pd.DataFrame) -> tuple:
+    """
+    Return (actual_return, hit) for the pick on the signal_date.
+    If the date is not in master or the column is missing, returns (None, None).
+    """
+    try:
+        date = pd.Timestamp(signal_date)
+        col = f"{pick}_ret"
+        if col in master.columns and date in master.index:
+            ret = master.loc[date, col]
+            if not np.isnan(ret):
+                return float(ret), bool(ret > 0)
+    except Exception:
+        pass
+    return None, None
+
+
 def _build_inference_tensors(option: str, master: pd.DataFrame, lookback: int, tickers: list):
     """Shared feature building for inference — used by both signal generators."""
     data       = loader.get_option_data(option, master)
@@ -144,6 +161,9 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     pick, conviction, weights_dict = _run_inference(model, scaler, X_asset, X_macro, label_names)
     signal_date = next_trading_day(last_data_date)
 
+    # Get actual return if the signal date is already in the past
+    actual_return, hit = _get_actual_return(pick, signal_date, master)
+
     print(f"  Option {option}: {pick} (conviction={conviction:.1%}) for {signal_date}")
     return {
         "option":         option,
@@ -162,6 +182,8 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
         "test_sharpe":    meta.get("test_sharpe", 0),
         "test_ann_return":meta.get("test_ann_return", 0),
         "model_n_params": meta["n_params"],
+        "actual_return":  actual_return,
+        "hit":            hit,
     }
 
 
@@ -197,7 +219,6 @@ def load_window_model(option: str) -> tuple:
         include_cash=include_cash,
     ).to(DEVICE)
     model.load_state_dict(state)
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
     return model, meta, scaler
 
@@ -220,6 +241,8 @@ def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
     pick, conviction, weights_dict = _run_inference(model, scaler, X_asset, X_macro, label_names)
     signal_date = next_trading_day(last_data_date)
 
+    actual_return, hit = _get_actual_return(pick, signal_date, master)
+
     print(f"  Option {option} window: {pick} (conviction={conviction:.1%}) | "
           f"Window {meta['winning_window']}: {meta['winning_train_start']}→{meta['winning_train_end']}")
     return {
@@ -241,6 +264,8 @@ def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
         "winning_loss":        meta["winning_loss"],
         "oos_ann_return":      meta["oos_ann_return"],
         "oos_sharpe":          meta["oos_sharpe"],
+        "actual_return":       actual_return,
+        "hit":                 hit,
     }
 
 
@@ -255,10 +280,12 @@ def update_signal_history(signal: dict, option: str) -> None:
             history = json.load(f)
 
     record = {
-        "signal_date":  signal["signal_date"],
-        "pick":         signal["pick"],
-        "conviction":   signal["conviction"],
-        "generated_at": signal["generated_at"],
+        "signal_date":   signal["signal_date"],
+        "pick":          signal["pick"],
+        "conviction":    signal["conviction"],
+        "generated_at":  signal["generated_at"],
+        "actual_return": signal.get("actual_return"),
+        "hit":           signal.get("hit"),
     }
     existing_dates = {r["signal_date"] for r in history}
     if record["signal_date"] not in existing_dates:
