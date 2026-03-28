@@ -1,15 +1,18 @@
 #!/usr/bin/env python
-# update_daily.py — P2-ETF-DEEPM-ENGINE (PRODUCTION-HARDENED)
+# update_daily.py — P2-ETF-DEEPM-ENGINE (with debug mode)
 # Daily update: fetch new trading day data (if any) and regenerate all derived files.
 
 import os
 import sys
+import argparse
 import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import time
 import random
+import requests
+from io import BytesIO
 
 import config as cfg
 import data_utils as du
@@ -36,61 +39,86 @@ def safe_to_datetime_index(df):
     return df
 
 
-def validate_ohlcv_structure(df, expected_tickers, target_date):
-    """Validate that fetched OHLCV has expected structure."""
-    if df is None or df.empty:
-        return False, "Empty DataFrame"
-    
-    if not isinstance(df.index, pd.DatetimeIndex):
-        return False, f"Index is {type(df.index)}, expected DatetimeIndex"
-    
-    df = safe_to_datetime_index(df)
-    
-    if target_date not in df.index:
-        return False, f"Target date {target_date.date()} not in index (have {df.index[0].date()} to {df.index[-1].date()})"
-    
-    expected_cols = {f"{t}_{field}" for t in expected_tickers for field in ['Open', 'High', 'Low', 'Close', 'Volume']}
-    missing = expected_cols - set(df.columns)
-    if missing:
-        log.warning(f"Missing OHLCV columns: {missing}")
-    
-    # Check for all-NaN rows (common yfinance failure mode)
-    nan_rows = df.isna().all(axis=1).sum()
-    if nan_rows > 0:
-        return False, f"DataFrame has {nan_rows} all-NaN rows"
-    
-    return True, "OK"
+def fetch_ohlcv_stooq(ticker, start, end):
+    """Fetch OHLCV from Stooq as fallback."""
+    stooq_symbol = ticker.lower() + '.us'
+    url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
+    try:
+        df = pd.read_csv(url, parse_dates=['Date'], index_col='Date')
+        if df.empty:
+            return None
+        df = df.sort_index()
+        mask = (df.index >= start) & (df.index <= end)
+        df = df.loc[mask]
+        if df.empty:
+            return None
+        # Rename columns to match yfinance format
+        df.columns = [c.lower() for c in df.columns]
+        # Stooq returns columns: Open, High, Low, Close, Volume
+        # We need to prefix with ticker
+        df = df.rename(columns={col: f"{ticker}_{col}" for col in df.columns})
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        return df
+    except Exception as e:
+        log.debug(f"Stooq failed for {ticker}: {e}")
+        return None
 
 
-def fetch_ohlcv_robust(tickers, start, end, target_date, max_retries=3):
-    """Fetch OHLCV with strict validation."""
+def fetch_ohlcv_robust(tickers, start, end, target_date, max_retries=3, debug=False):
+    """
+    Fetch OHLCV for all tickers, using yfinance first, then Stooq fallback per ticker.
+    Returns a MultiIndex DataFrame (ticker, field) or None.
+    """
+    # First try yfinance for all tickers
     for attempt in range(1, max_retries + 1):
         try:
-            log.info(f"Fetching OHLCV for {start} to {end} (attempt {attempt})")
+            log.info(f"Fetching OHLCV via yfinance for {start} to {end} (attempt {attempt})")
             data = du.download_ohlcv(tickers, start=start, end=end)
-            
-            # Validate structure
-            valid, msg = validate_ohlcv_structure(data, tickers, target_date)
-            if valid:
-                log.info(f"Successfully fetched OHLCV with shape {data.shape}")
-                return data
-            else:
-                log.warning(f"OHLCV validation failed: {msg}")
-                if attempt < max_retries:
-                    time.sleep(2**attempt + random.uniform(0, 1))
+            if data is not None and not data.empty:
+                data = safe_to_datetime_index(data)
+                if target_date in data.index:
+                    log.info(f"yfinance success: found {target_date.date()}")
+                    return data
                 else:
-                    return None
-                    
-        except Exception as e:
-            log.warning(f"OHLCV fetch exception (attempt {attempt}): {e}")
-            if attempt < max_retries:
-                time.sleep(2**attempt + random.uniform(0, 1))
+                    log.warning(f"yfinance returned data but missing target date {target_date.date()}")
             else:
-                return None
-    return None
+                log.warning(f"yfinance returned empty")
+        except Exception as e:
+            log.warning(f"yfinance exception (attempt {attempt}): {e}")
+        
+        if attempt < max_retries and not debug:
+            time.sleep(2**attempt + random.uniform(0, 1))
+    
+    # yfinance failed; try Stooq per ticker
+    log.info("yfinance failed, trying Stooq fallback per ticker...")
+    frames = []
+    for ticker in tickers:
+        stooq_df = fetch_ohlcv_stooq(ticker, start, end)
+        if stooq_df is not None:
+            frames.append(stooq_df)
+            log.info(f"Stooq success for {ticker}")
+        else:
+            log.warning(f"No Stooq data for {ticker}")
+        if not debug:
+            time.sleep(random.uniform(0.5, 1.5))
+    
+    if not frames:
+        log.error("All fetch methods failed")
+        return None
+    
+    # Combine and convert to MultiIndex
+    combined = pd.concat(frames, axis=1)
+    # Convert to MultiIndex (ticker, field)
+    multi_cols = []
+    for col in combined.columns:
+        ticker, field = col.split('_', 1)
+        multi_cols.append((ticker, field))
+    combined.columns = pd.MultiIndex.from_tuples(multi_cols)
+    combined.index = pd.to_datetime(combined.index).tz_localize(None)
+    return combined
 
 
-def fetch_fred_robust(target_date, max_retries=3):
+def fetch_fred_robust(target_date, max_retries=3, debug=False):
     """
     Fetch FRED data robustly.
     FRED requires start < end, so we fetch a window and extract target date.
@@ -108,7 +136,8 @@ def fetch_fred_robust(target_date, max_retries=3):
             
             if data is None or data.empty:
                 log.warning(f"FRED returned empty (attempt {attempt})")
-                time.sleep(2**attempt)
+                if not debug:
+                    time.sleep(2**attempt)
                 continue
             
             data = safe_to_datetime_index(data)
@@ -133,7 +162,7 @@ def fetch_fred_robust(target_date, max_retries=3):
                     
         except Exception as e:
             log.error(f"FRED fetch exception (attempt {attempt}): {e}")
-            if attempt < max_retries:
+            if attempt < max_retries and not debug:
                 time.sleep(2**attempt)
             else:
                 return pd.DataFrame()
@@ -141,7 +170,7 @@ def fetch_fred_robust(target_date, max_retries=3):
     return pd.DataFrame()
 
 
-def atomic_update(target_date, ohlcv, macro):
+def atomic_update(target_date, ohlcv, macro, debug=False):
     """
     Perform atomic update: fetch new data and return updated DataFrames.
     Does NOT modify original DataFrames until all data is validated.
@@ -149,42 +178,33 @@ def atomic_update(target_date, ohlcv, macro):
     start = target_date.strftime("%Y-%m-%d")
     end = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
     
-    # Fetch OHLCV
-    ohlcv_multi = fetch_ohlcv_robust(cfg.ALL_TICKERS, start, end, target_date)
+    # Fetch OHLCV with fallback
+    ohlcv_multi = fetch_ohlcv_robust(cfg.ALL_TICKERS, start, end, target_date, debug=debug)
     if ohlcv_multi is None:
         raise ValueError(f"Failed to fetch OHLCV for {target_date.date()}")
     
+    # Ensure target date exists
+    ohlcv_multi = safe_to_datetime_index(ohlcv_multi)
+    if target_date not in ohlcv_multi.index:
+        raise ValueError(f"Date {target_date.date()} not in fetched OHLCV")
+    
+    # Flatten to flat columns
     new_ohlcv_flat = du.flatten_ohlcv(ohlcv_multi)
     new_ohlcv_flat = safe_to_datetime_index(new_ohlcv_flat)
     
-    # Validate exact date present
-    if target_date not in new_ohlcv_flat.index:
-        raise ValueError(f"Date {target_date.date()} not in flattened OHLCV")
-    
+    # Reindex to match existing columns (missing columns become NaN)
     new_ohlcv_row = new_ohlcv_flat.loc[[target_date]]
+    new_ohlcv_row = new_ohlcv_row.reindex(columns=ohlcv.columns)
     
     # Fetch Macro
-    new_macro = fetch_fred_robust(target_date)
+    new_macro = fetch_fred_robust(target_date, debug=debug)
     if new_macro.empty:
         log.warning(f"No FRED data for {target_date.date()}, creating NaN row")
-        new_macro = pd.DataFrame(index=[target_date], columns=cfg.FRED_SERIES.keys(), dtype=float)
+        new_macro = pd.DataFrame(index=[target_date], columns=macro.columns, dtype=float)
+    else:
+        new_macro = new_macro.reindex(columns=macro.columns)
     
-    # Align columns
-    missing_ohlcv_cols = set(ohlcv.columns) - set(new_ohlcv_row.columns)
-    if missing_ohlcv_cols:
-        log.warning(f"New OHLCV missing columns: {missing_ohlcv_cols}")
-    
-    new_ohlcv_row = new_ohlcv_row.reindex(columns=ohlcv.columns)
-    new_macro = new_macro.reindex(columns=macro.columns)
-    
-    # Check for existing date (shouldn't happen if logic is correct, but safety check)
-    if target_date in ohlcv.index:
-        log.warning(f"Overwriting existing OHLCV date {target_date.date()}")
-    
-    if target_date in macro.index:
-        log.warning(f"Overwriting existing Macro date {target_date.date()}")
-    
-    # Create new DataFrames (don't modify in-place until sure)
+    # Combine
     ohlcv_new = pd.concat([ohlcv, new_ohlcv_row]).sort_index()
     macro_new = pd.concat([macro, new_macro]).sort_index()
     
@@ -218,9 +238,11 @@ def validate_derived_data(returns, vol, macro_derived, master):
     return errors
 
 
-def update_master():
+def update_master(debug=False):
     log.info("=" * 60)
     log.info(f"P2-ETF-DEEPM DAILY UPDATE — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    if debug:
+        log.info("*** DEBUG MODE – NO UPLOADS ***")
     log.info("=" * 60)
 
     # 1. Load current base files
@@ -272,16 +294,25 @@ def update_master():
         log.info(f"New trading day detected: {target_date.date()}")
         
         try:
-            ohlcv_updated, macro_updated = atomic_update(target_date, ohlcv, macro)
-            update_performed = True
-            
-            # Upload base files only after successful validation
-            log.info("Uploading updated base files...")
-            du.upload_parquet(ohlcv_updated, cfg.FILE_ETF_OHLCV, 
-                            f"Daily update: added {target_date.date()}")
-            du.upload_parquet(macro_updated, cfg.FILE_MACRO_FRED, 
-                            f"Daily update: added {target_date.date()}")
-            log.info("Base files uploaded successfully")
+            if debug:
+                log.info("DEBUG: Simulating atomic update (will not upload)")
+                ohlcv_updated, macro_updated = atomic_update(target_date, ohlcv, macro, debug=True)
+                update_performed = True
+                # Log what would be uploaded
+                log.info(f"Would upload OHLCV row for {target_date.date()}")
+                log.info(f"OHLCV row columns count: {len(new_ohlcv_row.columns)}")
+                log.info(f"Macro row columns count: {len(new_macro.columns)}")
+            else:
+                ohlcv_updated, macro_updated = atomic_update(target_date, ohlcv, macro)
+                update_performed = True
+                
+                # Upload base files only after successful validation
+                log.info("Uploading updated base files...")
+                du.upload_parquet(ohlcv_updated, cfg.FILE_ETF_OHLCV, 
+                                f"Daily update: added {target_date.date()}")
+                du.upload_parquet(macro_updated, cfg.FILE_MACRO_FRED, 
+                                f"Daily update: added {target_date.date()}")
+                log.info("Base files uploaded successfully")
             
         except Exception as e:
             log.error(f"Atomic update failed: {e}")
@@ -323,26 +354,34 @@ def update_master():
                 log.error(f"Validation error: {err}")
             raise ValueError("Derived data validation failed")
         
-        # Upload derived files
-        du.upload_parquet(returns, cfg.FILE_ETF_RETURNS, 
-                         f"Daily update: returns to {returns.index[-1].date()}")
-        du.upload_parquet(vol, cfg.FILE_ETF_VOL, 
-                         f"Daily update: vol to {vol.index[-1].date()}")
-        du.upload_parquet(macro_derived, cfg.FILE_MACRO_DERIVED, 
-                         f"Daily update: derived macro to {macro_derived.index[-1].date()}")
-        du.upload_parquet(master, cfg.FILE_MASTER, 
-                         f"Daily update: master to {master.index[-1].date()}")
-        
-        # Metadata
-        metadata = {
-            "last_updated": datetime.utcnow().isoformat(),
-            "last_trading_day": str(master.index[-1].date()),
-            "n_trading_days": len(master),
-            "update_type": "incremental" if update_performed else "derived_only",
-            "last_run_status": "success"
-        }
-        du.upload_json(metadata, cfg.FILE_METADATA, 
-                      f"Daily update: metadata to {master.index[-1].date()}")
+        if debug:
+            log.info("DEBUG: Derived files computed, would upload:")
+            log.info(f"  returns: {returns.shape}, last date {returns.index[-1].date()}")
+            log.info(f"  vol: {vol.shape}, last date {vol.index[-1].date()}")
+            log.info(f"  macro_derived: {macro_derived.shape}, last date {macro_derived.index[-1].date()}")
+            log.info(f"  master: {master.shape}, last date {master.index[-1].date()}")
+            log.info(f"  metadata: last_trading_day={master.index[-1].date()}")
+        else:
+            # Upload derived files
+            du.upload_parquet(returns, cfg.FILE_ETF_RETURNS, 
+                             f"Daily update: returns to {returns.index[-1].date()}")
+            du.upload_parquet(vol, cfg.FILE_ETF_VOL, 
+                             f"Daily update: vol to {vol.index[-1].date()}")
+            du.upload_parquet(macro_derived, cfg.FILE_MACRO_DERIVED, 
+                             f"Daily update: derived macro to {macro_derived.index[-1].date()}")
+            du.upload_parquet(master, cfg.FILE_MASTER, 
+                             f"Daily update: master to {master.index[-1].date()}")
+            
+            # Metadata
+            metadata = {
+                "last_updated": datetime.utcnow().isoformat(),
+                "last_trading_day": str(master.index[-1].date()),
+                "n_trading_days": len(master),
+                "update_type": "incremental" if update_performed else "derived_only",
+                "last_run_status": "success"
+            }
+            du.upload_json(metadata, cfg.FILE_METADATA, 
+                          f"Daily update: metadata to {master.index[-1].date()}")
         
         log.info("=" * 60)
         log.info("SUCCESS: All datasets updated")
@@ -357,6 +396,11 @@ def update_master():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true",
+                        help="Run in debug mode – print what would be updated but do not upload")
+    args = parser.parse_args()
+
     if not cfg.HF_TOKEN:
         log.error("HF_TOKEN not set")
         sys.exit(1)
@@ -364,4 +408,4 @@ if __name__ == "__main__":
         log.error("FRED_API_KEY not set")
         sys.exit(1)
     
-    update_master()
+    update_master(debug=args.debug)
