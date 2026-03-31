@@ -58,14 +58,17 @@ def _fetch_one_ticker_robust(ticker: str, start: str, end: str, data_type: str =
     # ----- yfinance attempt with retries -----
     for attempt in range(max_retries + 1):
         try:
+            # CRITICAL FIX: Don't use session for yf.download to avoid crumb issues
+            # Use threads=False and add random delay before each request
+            time.sleep(random.uniform(1, 3))  # Random delay before each attempt
+            
             df = yf.download(
                 ticker,
                 start=start,
                 end=end,
                 auto_adjust=True,
                 progress=False,
-                session=_YF_SESSION,
-                threads=False,
+                threads=False,  # CRITICAL: Must be False to avoid rate limiting
             )
             if df.empty:
                 raise ValueError("Empty data from yfinance")
@@ -86,12 +89,12 @@ def _fetch_one_ticker_robust(ticker: str, start: str, end: str, data_type: str =
             if attempt == max_retries:
                 logger.warning(f"yfinance failed for {ticker} after {max_retries} retries: {e}")
                 break
-            sleep_time = base_delay * (2 ** attempt) + random.uniform(0, 2)
+            sleep_time = base_delay * (2 ** attempt) + random.uniform(0, 5)
             logger.info(f"Retry {attempt+1}/{max_retries} for {ticker} after {sleep_time:.1f}s...")
             time.sleep(sleep_time)
 
     # ----- Stooq fallback with multiple suffixes -----
-    suffixes = ['', '.US', '-US', '_U', '.U', '-U', '_U', ' US', ' US']
+    suffixes = ['', '.US', '-US', '_U', '.U', '-U', ' US']
     tried = set()
     for suffix in suffixes:
         stooq_ticker = f"{ticker}{suffix}"
@@ -137,48 +140,27 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     end = end or date.today().strftime("%Y-%m-%d")
     logger.info(f"Downloading OHLCV: {tickers} from {start} to {end}")
 
-    # First attempt: batch download with retries
-    for attempt in range(3):   # up to 3 batch attempts
-        try:
-            raw = yf.download(
-                tickers,
-                start=start,
-                end=end,
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-                session=_YF_SESSION,
-            )
-            if raw.empty:
-                raise ValueError("Empty batch result")
-            # Success
-            raw.index = pd.to_datetime(raw.index).tz_localize(None)
-            if isinstance(raw.columns, pd.MultiIndex):
-                df = raw.copy()
-            else:
-                # Single ticker case
-                ticker = tickers[0] if len(tickers) == 1 else tickers[0]
-                df = pd.concat({ticker: raw}, axis=1)
-                df.columns = pd.MultiIndex.from_tuples(
-                    [(t, f) for t, f in df.columns], names=["Ticker", "Field"]
-                )
-            df.columns.names = ["Ticker", "Field"]
-            df = df.sort_index()
-            logger.info(f"OHLCV batch download successful. Shape: {df.shape}")
-            return df
-        except Exception as e:
-            if attempt == 2:
-                logger.warning(f"Batch download failed after 3 attempts: {e}. Falling back to one-by-one.")
-                break
-            sleep_time = 60 * (2 ** attempt) + random.uniform(0, 10)  # 60, 120, 240 seconds
-            logger.info(f"Batch retry {attempt+1}/3 after {sleep_time:.1f}s...")
-            time.sleep(sleep_time)
-
-    # Fallback: download each ticker individually with robust helper
+    # CRITICAL FIX: Skip batch download entirely in CI/GitHub Actions environment
+    # Batch downloads cause rate limiting (429 errors) on shared IPs
+    # Always use individual downloads with delays
+    
+    logger.info("Using individual ticker downloads to avoid rate limiting...")
+    
     frames = []
     for i, ticker in enumerate(tickers):
-        logger.info(f"Downloading {ticker} individually ({i+1}/{len(tickers)})...")
-        df = _fetch_one_ticker_robust(ticker, start, end, data_type="ohlcv")
+        logger.info(f"Downloading {ticker} ({i+1}/{len(tickers)})...")
+        
+        # CRITICAL FIX: Add progressive delay between downloads
+        # Longer delay for every 5th ticker to avoid burst detection
+        base_wait = 2 + random.uniform(0, 2)  # 2-4 seconds base
+        if i % 5 == 0 and i > 0:
+            base_wait += 5  # Extra 5s every 5 tickers
+            logger.info(f"Adding extra delay for rate limit protection...")
+        
+        time.sleep(base_wait)
+        
+        df = _fetch_one_ticker_robust(ticker, start, end, data_type="ohlcv", max_retries=3)
+        
         if df is not None:
             # Re‑create MultiIndex columns
             df.columns = pd.MultiIndex.from_tuples([(ticker, col) for col in df.columns],
@@ -186,8 +168,6 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
             frames.append(df)
         else:
             logger.warning(f"Could not fetch {ticker} after all attempts")
-        # Very long delay between individual downloads
-        time.sleep(10 + random.uniform(0, 2))
 
     if not frames:
         raise ValueError(f"No OHLCV data fetched for any ticker.")
@@ -195,7 +175,7 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     combined = pd.concat(frames, axis=1)
     combined.index = pd.to_datetime(combined.index).tz_localize(None)
     combined.sort_index(inplace=True)
-    logger.info(f"OHLCV fallback download successful. Shape: {combined.shape}")
+    logger.info(f"OHLCV download successful. Shape: {combined.shape}")
     return combined
 
 
