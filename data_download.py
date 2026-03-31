@@ -9,59 +9,141 @@
 
 import argparse
 import os
+import time
 import warnings
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import pandas_datareader as pdr
 import yfinance as yf
 from fredapi import Fred
 from tqdm import tqdm
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import config
 
 warnings.filterwarnings("ignore")
 os.makedirs(config.DATA_DIR, exist_ok=True)
 
+# ------------------------------------------------------------
+#  Helper: robust yfinance session with retries
+# ------------------------------------------------------------
+def get_yf_session():
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    return session
 
-# ── Price fetching ─────────────────────────────────────────────────────────────
+# ------------------------------------------------------------
+#  Ticker data fetcher with retries and Stooq fallback
+# ------------------------------------------------------------
+def fetch_ticker_with_fallback(
+    ticker: str,
+    start: str,
+    end: str,
+    data_type: str = "ohlcv",
+    max_retries: int = 3,
+    delay: float = 2.0,
+) -> pd.DataFrame | None:
+    """
+    Fetch data for a single ticker.
+    data_type: 'ohlcv' -> returns OHLCV columns, 'close' -> returns only close.
+    Returns DataFrame or None if both sources fail.
+    """
+    # ----- yfinance attempt with retries -----
+    for attempt in range(max_retries + 1):
+        try:
+            # Use robust session and avoid parallel downloads
+            df = yf.download(
+                ticker,
+                start=start,
+                end=end,
+                auto_adjust=True,      # keep splits/dividends adjusted
+                progress=False,
+                session=get_yf_session(),
+                threads=False,
+            )
+            if df.empty:
+                raise ValueError("Empty data from yfinance")
+            # Flatten MultiIndex if present
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [col[0] for col in df.columns]
 
+            # Return requested data
+            if data_type == "ohlcv":
+                # Keep only OHLCV columns (some tickers might lack volume)
+                keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                df = df[keep_cols].copy()
+            else:  # close only
+                if "Close" not in df.columns:
+                    raise ValueError("No Close column in yfinance data")
+                df = df[["Close"]].copy()
+                df.columns = [ticker]   # rename column to ticker
+            return df
+
+        except Exception as e:
+            if attempt == max_retries:
+                print(f"yfinance failed for {ticker} after {max_retries} retries: {e}")
+                break
+            wait = delay * (2 ** attempt)
+            print(f"Retry {attempt+1}/{max_retries} for {ticker} after {wait:.1f}s...")
+            time.sleep(wait)
+
+    # ----- Stooq fallback -----
+    try:
+        print(f"Falling back to Stooq for {ticker}...")
+        # Use pandas_datareader's Stooq reader
+        df = pdr.DataReader(ticker, 'stooq', start, end)
+        if df.empty:
+            raise ValueError("Empty data from Stooq")
+        # Stooq returns columns: Open, High, Low, Close, Volume (same as yfinance)
+        if data_type == "ohlcv":
+            keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            df = df[keep_cols].copy()
+        else:  # close only
+            if "Close" not in df.columns:
+                raise ValueError("No Close column in Stooq data")
+            df = df[["Close"]].copy()
+            df.columns = [ticker]
+        return df
+    except Exception as e:
+        print(f"Stooq also failed for {ticker}: {e}")
+        return None
+
+# ------------------------------------------------------------
+#  Price fetching (close only) with fallback
+# ------------------------------------------------------------
 def fetch_prices(tickers: list, start: str, end: str) -> pd.DataFrame:
     """
-    Fetch Close prices one ticker at a time to avoid yfinance rate limits.
+    Fetch Close prices one ticker at a time, with retries and Stooq fallback.
     Returns DataFrame: index=Date, columns=tickers (Close only).
     """
     print(f"Fetching prices {start} -> {end} ({len(tickers)} tickers)")
     frames = []
 
     for ticker in tqdm(tickers, desc="Prices"):
-        try:
-            df = yf.download(
-                ticker,
-                start=start,
-                end=end,
-                auto_adjust=True,
-                progress=False,
-            )
-            if df.empty:
-                print(f"  WARNING: {ticker} returned empty")
-                continue
-
-            # Flatten MultiIndex columns (newer yfinance versions)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [col[0] for col in df.columns]
-
-            close = df[["Close"]].rename(columns={"Close": ticker})
-            frames.append(close)
-
-        except Exception as e:
-            print(f"  WARNING: {ticker} failed: {e}")
+        df = fetch_ticker_with_fallback(ticker, start, end, data_type="close")
+        if df is not None:
+            frames.append(df)
+        else:
+            print(f"  WARNING: {ticker} returned empty after all attempts")
+        # Small delay between tickers to avoid rate limits
+        time.sleep(0.5)
 
     if not frames:
         raise RuntimeError("No price data fetched — all tickers failed.")
 
     prices = pd.concat(frames, axis=1)
-
     # Clean up any MultiIndex columns from concat
     if isinstance(prices.columns, pd.MultiIndex):
         prices.columns = [col[0] if col[0] != "" else col[1] for col in prices.columns]
@@ -75,40 +157,27 @@ def fetch_prices(tickers: list, start: str, end: str) -> pd.DataFrame:
     print(f"  Prices: {prices.shape}, range: {prices.index[0].date()} -> {prices.index[-1].date()}")
     return prices.sort_index()
 
-
+# ------------------------------------------------------------
+#  OHLCV fetching with fallback
+# ------------------------------------------------------------
 def fetch_ohlcv(tickers: list, start: str, end: str) -> pd.DataFrame:
     """
-    Fetch full OHLCV one ticker at a time.
+    Fetch full OHLCV one ticker at a time, with retries and Stooq fallback.
     Returns flat DataFrame: TLT_Open, TLT_High, TLT_Low, TLT_Close, TLT_Volume, ...
     """
     print(f"Fetching OHLCV {start} -> {end} ({len(tickers)} tickers)")
     frames = []
 
     for ticker in tqdm(tickers, desc="OHLCV"):
-        try:
-            df = yf.download(
-                ticker,
-                start=start,
-                end=end,
-                auto_adjust=True,
-                progress=False,
-            )
-            if df.empty:
-                print(f"  WARNING: {ticker} returned empty")
-                continue
-
-            # Flatten MultiIndex columns
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [col[0] for col in df.columns]
-
-            # Keep OHLCV, rename with ticker prefix
-            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            df = df[keep].copy()
+        df = fetch_ticker_with_fallback(ticker, start, end, data_type="ohlcv")
+        if df is not None:
+            # Prefix column names with ticker
             df.columns = [f"{ticker}_{c}" for c in df.columns]
             frames.append(df)
-
-        except Exception as e:
-            print(f"  WARNING: {ticker} failed: {e}")
+        else:
+            print(f"  WARNING: {ticker} returned empty after all attempts")
+        # Small delay between tickers
+        time.sleep(0.5)
 
     if not frames:
         raise RuntimeError("No OHLCV data fetched — all tickers failed.")
@@ -123,8 +192,10 @@ def fetch_ohlcv(tickers: list, start: str, end: str) -> pd.DataFrame:
     print(f"  OHLCV: {ohlcv.shape}, range: {ohlcv.index[0].date()} -> {ohlcv.index[-1].date()}")
     return ohlcv.sort_index()
 
-
-# ── Derived: returns & volatility ──────────────────────────────────────────────
+# ------------------------------------------------------------
+#  Rest of the script (unchanged except for imports)
+#  All other functions remain exactly as they were.
+# ------------------------------------------------------------
 
 def compute_returns_simple(prices: pd.DataFrame) -> pd.DataFrame:
     """Simple daily returns."""
@@ -132,13 +203,11 @@ def compute_returns_simple(prices: pd.DataFrame) -> pd.DataFrame:
     rets.index.name = "Date"
     return rets
 
-
 def compute_returns_log(prices: pd.DataFrame) -> pd.DataFrame:
     """Log daily returns."""
     rets = np.log(prices / prices.shift(1)).dropna(how="all")
     rets.index.name = "Date"
     return rets
-
 
 def compute_volatility(log_returns: pd.DataFrame) -> pd.DataFrame:
     """Annualised rolling volatility."""
@@ -146,7 +215,6 @@ def compute_volatility(log_returns: pd.DataFrame) -> pd.DataFrame:
     vol = vol.dropna(how="all")
     vol.index.name = "Date"
     return vol
-
 
 def compute_all_returns(prices: pd.DataFrame) -> pd.DataFrame:
     """
@@ -162,9 +230,6 @@ def compute_all_returns(prices: pd.DataFrame) -> pd.DataFrame:
     combined = pd.concat([simple, log], axis=1).sort_index(axis=1)
     combined.index.name = "Date"
     return combined.dropna(how="all")
-
-
-# ── FRED macro ─────────────────────────────────────────────────────────────────
 
 def fetch_macro(start: str, end: str) -> pd.DataFrame:
     """
@@ -201,9 +266,6 @@ def fetch_macro(start: str, end: str) -> pd.DataFrame:
 
     print(f"  Macro: {macro.shape}")
     return macro
-
-
-# ── Derived macro features ─────────────────────────────────────────────────────
 
 def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
     """
@@ -268,9 +330,6 @@ def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
     print(f"  Derived macro: {d.shape}, cols: {list(d.columns)}")
     return d
 
-
-# ── Save / load ────────────────────────────────────────────────────────────────
-
 def save_parquet(df: pd.DataFrame, name: str) -> None:
     """
     Save DataFrame to data/{name}.parquet.
@@ -298,7 +357,6 @@ def save_parquet(df: pd.DataFrame, name: str) -> None:
     df_save.to_parquet(path, index=False, engine="pyarrow")
     print(f"  Saved {name}.parquet ({len(df_save)} rows, {df_save.shape[1]} cols)")
 
-
 def load_parquet(name: str) -> pd.DataFrame:
     """
     Load data/{name}.parquet and restore Date as DatetimeIndex.
@@ -324,7 +382,6 @@ def load_parquet(name: str) -> pd.DataFrame:
             df = df.drop(columns=[col])
 
     return df.sort_index()
-
 
 def build_master(
     ohlcv: pd.DataFrame,
@@ -356,9 +413,6 @@ def build_master(
     master.index.name = "Date"
     print(f"  Master: {master.shape}, range: {master.index[0].date()} -> {master.index[-1].date()}")
     return master
-
-
-# ── Full rebuild ───────────────────────────────────────────────────────────────
 
 def build_all(start: str, end: str) -> None:
     print(f"\n{'='*60}")
@@ -408,9 +462,6 @@ def build_all(start: str, end: str) -> None:
     print(f"  Trading days : {len(master)}")
     print(f"  Master cols  : {master.shape[1]}")
     print(f"{'='*60}")
-
-
-# ── Incremental update ─────────────────────────────────────────────────────────
 
 def incremental_update() -> None:
     print("\nIncremental update mode...")
@@ -468,13 +519,9 @@ def incremental_update() -> None:
 
     print(f"\nUpdate complete. Latest: {master.index[-1].date()}, Total days: {len(master)}")
 
-
-# ── Entry point ────────────────────────────────────────────────────────────────
-
 def seed() -> None:
     end = datetime.today().strftime("%Y-%m-%d")
     build_all(start=config.DATA_START, end=end)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="P2-ETF-DEEPM dataset builder")
