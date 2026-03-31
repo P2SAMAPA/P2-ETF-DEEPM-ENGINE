@@ -1,5 +1,5 @@
 # data_download.py — ETF OHLCV + FRED macro downloader
-# Proven pattern: one ticker at a time to avoid yfinance rate limits.
+# Highly robust version: retries, delays, and Stooq fallback.
 # Saves all parquet files locally to data/ directory.
 # Then data_upload_hf.py pushes them to HuggingFace.
 #
@@ -20,9 +20,6 @@ import pandas_datareader as pdr
 import yfinance as yf
 from fredapi import Fred
 from tqdm import tqdm
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 import config
 
@@ -31,33 +28,9 @@ os.makedirs(config.DATA_DIR, exist_ok=True)
 
 
 # ------------------------------------------------------------
-#  Helper: robust yfinance session with retries
+#  Helper: fetch one ticker with retries and Stooq fallback
 # ------------------------------------------------------------
-def get_yf_session():
-    session = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS"]
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount('https://', adapter)
-    session.mount('http://', adapter)
-    return session
-
-
-# ------------------------------------------------------------
-#  Ticker data fetcher with retries and Stooq fallback
-# ------------------------------------------------------------
-def fetch_ticker_with_fallback(
-    ticker: str,
-    start: str,
-    end: str,
-    data_type: str = "ohlcv",
-    max_retries: int = 5,
-    base_delay: float = 5.0,
-) -> pd.DataFrame | None:
+def fetch_one_ticker(ticker: str, start: str, end: str, data_type: str = "ohlcv", max_retries: int = 5, base_delay: float = 5.0):
     """
     Fetch data for a single ticker.
     data_type: 'ohlcv' -> returns OHLCV columns, 'close' -> returns only close.
@@ -71,10 +44,9 @@ def fetch_ticker_with_fallback(
                 ticker,
                 start=start,
                 end=end,
-                auto_adjust=True,
+                auto_adjust=True,       # adjust for splits/dividends (consistent with working repo)
                 progress=False,
-                session=get_yf_session(),
-                threads=False,
+                threads=False,          # avoid parallel issues
             )
             if df.empty:
                 raise ValueError("Empty data from yfinance")
@@ -84,7 +56,7 @@ def fetch_ticker_with_fallback(
             if data_type == "ohlcv":
                 keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
                 df = df[keep_cols].copy()
-            else:
+            else:  # close only
                 if "Close" not in df.columns:
                     raise ValueError("No Close column")
                 df = df[["Close"]].copy()
@@ -95,20 +67,23 @@ def fetch_ticker_with_fallback(
             if attempt == max_retries:
                 print(f"yfinance failed for {ticker} after {max_retries} retries: {e}")
                 break
-            # Exponential backoff with jitter
             sleep_time = base_delay * (2 ** attempt) + random.uniform(0, 1)
             print(f"Retry {attempt+1}/{max_retries} for {ticker} after {sleep_time:.1f}s...")
             time.sleep(sleep_time)
 
     # ----- Stooq fallback -----
-    # Try original ticker first, then with .US suffix (common for US ETFs)
+    # Try original ticker, then with .US suffix
     stooq_tickers = [ticker, f"{ticker}.US"]
     for stooq_ticker in stooq_tickers:
         try:
             print(f"Falling back to Stooq for {stooq_ticker}...")
             df = pdr.DataReader(stooq_ticker, 'stooq', start, end)
             if df.empty:
-                raise ValueError("Empty data from Stooq")
+                # Maybe the symbol exists but only for a shorter period? Try last 5 years.
+                short_start = (datetime.now() - timedelta(days=5*365)).strftime("%Y-%m-%d")
+                df = pdr.DataReader(stooq_ticker, 'stooq', short_start, end)
+                if df.empty:
+                    raise ValueError("Empty data from Stooq")
             # Stooq returns same columns: Open, High, Low, Close, Volume
             if data_type == "ohlcv":
                 keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
@@ -128,24 +103,21 @@ def fetch_ticker_with_fallback(
 
 
 # ------------------------------------------------------------
-#  Price fetching (close only) with fallback
+#  Price fetching (close only)
 # ------------------------------------------------------------
 def fetch_prices(tickers: list, start: str, end: str) -> pd.DataFrame:
-    """
-    Fetch Close prices one ticker at a time, with retries and Stooq fallback.
-    Returns DataFrame: index=Date, columns=tickers (Close only).
-    """
+    """Fetch Close prices one ticker at a time, with retries and Stooq fallback."""
     print(f"Fetching prices {start} -> {end} ({len(tickers)} tickers)")
     frames = []
 
     for ticker in tqdm(tickers, desc="Prices"):
-        df = fetch_ticker_with_fallback(ticker, start, end, data_type="close")
+        df = fetch_one_ticker(ticker, start, end, data_type="close")
         if df is not None:
             frames.append(df)
         else:
             print(f"  WARNING: {ticker} returned empty after all attempts")
-        # Increased delay between tickers to avoid rate limits
-        time.sleep(0.8)
+        # Long delay between tickers to avoid rate limits
+        time.sleep(3 + random.uniform(0, 1))
 
     if not frames:
         raise RuntimeError("No price data fetched — all tickers failed.")
@@ -165,25 +137,22 @@ def fetch_prices(tickers: list, start: str, end: str) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-#  OHLCV fetching with fallback
+#  OHLCV fetching
 # ------------------------------------------------------------
 def fetch_ohlcv(tickers: list, start: str, end: str) -> pd.DataFrame:
-    """
-    Fetch full OHLCV one ticker at a time, with retries and Stooq fallback.
-    Returns flat DataFrame: TLT_Open, TLT_High, TLT_Low, TLT_Close, TLT_Volume, ...
-    """
+    """Fetch full OHLCV one ticker at a time, with retries and Stooq fallback."""
     print(f"Fetching OHLCV {start} -> {end} ({len(tickers)} tickers)")
     frames = []
 
     for ticker in tqdm(tickers, desc="OHLCV"):
-        df = fetch_ticker_with_fallback(ticker, start, end, data_type="ohlcv")
+        df = fetch_one_ticker(ticker, start, end, data_type="ohlcv")
         if df is not None:
             df.columns = [f"{ticker}_{c}" for c in df.columns]
             frames.append(df)
         else:
             print(f"  WARNING: {ticker} returned empty after all attempts")
-        # Increased delay between tickers
-        time.sleep(0.8)
+        # Long delay between tickers
+        time.sleep(3 + random.uniform(0, 1))
 
     if not frames:
         raise RuntimeError("No OHLCV data fetched — all tickers failed.")
@@ -200,7 +169,7 @@ def fetch_ohlcv(tickers: list, start: str, end: str) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-#  The rest of the script (unchanged)
+#  The rest of your script (unchanged except the delay)
 # ------------------------------------------------------------
 
 def compute_returns_simple(prices: pd.DataFrame) -> pd.DataFrame:
@@ -231,10 +200,10 @@ def compute_all_returns(prices: pd.DataFrame) -> pd.DataFrame:
     Columns: TLT_ret, TLT_logret, LQD_ret, LQD_logret, ...
     """
     simple = compute_returns_simple(prices)
-    log = compute_returns_log(prices)
+    log    = compute_returns_log(prices)
 
-    simple.columns = [f"{c}_ret" for c in simple.columns]
-    log.columns = [f"{c}_logret" for c in log.columns]
+    simple.columns = [f"{c}_ret"    for c in simple.columns]
+    log.columns    = [f"{c}_logret" for c in log.columns]
 
     combined = pd.concat([simple, log], axis=1).sort_index(axis=1)
     combined.index.name = "Date"
@@ -287,44 +256,44 @@ def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
     w = config.ZSCORE_WINDOW
 
     def zscore(s: pd.Series) -> pd.Series:
-        mu = s.rolling(w, min_periods=w // 2).mean()
+        mu  = s.rolling(w, min_periods=w // 2).mean()
         sig = s.rolling(w, min_periods=w // 2).std()
         return (s - mu) / (sig + 1e-8)
 
     if "VIX" in macro.columns:
-        d["VIX_zscore"] = zscore(macro["VIX"])
-        d["VIX_log"] = np.log(macro["VIX"].clip(lower=0.01))
-        d["VIX_chg1d"] = macro["VIX"].pct_change()
+        d["VIX_zscore"]   = zscore(macro["VIX"])
+        d["VIX_log"]      = np.log(macro["VIX"].clip(lower=0.01))
+        d["VIX_chg1d"]    = macro["VIX"].pct_change()
 
     if "T10Y2Y" in macro.columns:
-        d["YC_slope"] = macro["T10Y2Y"]
-        d["YC_slope_zscore"] = zscore(macro["T10Y2Y"])
-        d["YC_slope_chg"] = macro["T10Y2Y"].diff()
+        d["YC_slope"]         = macro["T10Y2Y"]
+        d["YC_slope_zscore"]  = zscore(macro["T10Y2Y"])
+        d["YC_slope_chg"]     = macro["T10Y2Y"].diff()
 
     if "DGS10" in macro.columns:
         d["DGS10_zscore"] = zscore(macro["DGS10"])
-        d["DGS10_chg"] = macro["DGS10"].diff()
+        d["DGS10_chg"]    = macro["DGS10"].diff()
 
     if "HY_SPREAD" in macro.columns:
         d["HY_spread_zscore"] = zscore(macro["HY_SPREAD"])
-        d["HY_spread_chg"] = macro["HY_SPREAD"].diff()
+        d["HY_spread_chg"]    = macro["HY_SPREAD"].diff()
 
     if "IG_SPREAD" in macro.columns:
         d["IG_spread_zscore"] = zscore(macro["IG_SPREAD"])
 
     if "HY_SPREAD" in macro.columns and "IG_SPREAD" in macro.columns:
-        d["HY_IG_ratio"] = macro["HY_SPREAD"] / (macro["IG_SPREAD"] + 1e-8)
+        d["HY_IG_ratio"]        = macro["HY_SPREAD"] / (macro["IG_SPREAD"] + 1e-8)
         d["HY_IG_ratio_zscore"] = zscore(d["HY_IG_ratio"])
-        d["credit_stress"] = (zscore(macro["HY_SPREAD"]) + zscore(macro["IG_SPREAD"])) / 2.0
+        d["credit_stress"]      = (zscore(macro["HY_SPREAD"]) + zscore(macro["IG_SPREAD"])) / 2.0
 
     if "USD_INDEX" in macro.columns:
         d["USD_zscore"] = zscore(macro["USD_INDEX"])
-        d["USD_chg"] = macro["USD_INDEX"].pct_change()
+        d["USD_chg"]    = macro["USD_INDEX"].pct_change()
 
     if "WTI_OIL" in macro.columns:
         d["OIL_zscore"] = zscore(macro["WTI_OIL"])
-        d["OIL_chg"] = macro["WTI_OIL"].pct_change()
-        d["OIL_log"] = np.log(macro["WTI_OIL"].clip(lower=0.01))
+        d["OIL_chg"]    = macro["WTI_OIL"].pct_change()
+        d["OIL_log"]    = np.log(macro["WTI_OIL"].clip(lower=0.01))
 
     if "DTB3" in macro.columns:
         d["TBILL_daily"] = macro["DTB3"] / 252.0 / 100.0
@@ -492,7 +461,7 @@ def incremental_update() -> None:
         return
 
     start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-    end = datetime.today().strftime("%Y-%m-%d")
+    end   = datetime.today().strftime("%Y-%m-%d")
 
     if start >= end:
         print(f"Already up to date (last: {last_date.date()}). Nothing to do.")
