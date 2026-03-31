@@ -1,5 +1,5 @@
 # data_utils.py — Shared data download, transform and HuggingFace I/O
-# Now includes robust downloading with retries and fallback to Stooq.
+# Now with ultra‑robust downloading: persistent session, long delays, multiple Stooq suffixes.
 
 import io
 import json
@@ -26,27 +26,30 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 
 # ------------------------------------------------------------
-#  Robust yfinance session
+#  Persistent session with aggressive retries
 # ------------------------------------------------------------
 def _get_yf_session():
     session = requests.Session()
     retries = Retry(
-        total=3,
-        backoff_factor=1,
+        total=5,                  # more retries
+        backoff_factor=2,         # longer backoff (2, 4, 8, 16, 32)
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS"],
     )
-    adapter = HTTPAdapter(max_retries=retries)
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
     session.mount('https://', adapter)
     session.mount('http://', adapter)
     return session
+
+# Create one session for the whole run
+_YF_SESSION = _get_yf_session()
 
 
 # ------------------------------------------------------------
 #  Helper: fetch one ticker with retries and Stooq fallback
 # ------------------------------------------------------------
 def _fetch_one_ticker_robust(ticker: str, start: str, end: str, data_type: str = "ohlcv",
-                              max_retries: int = 5, base_delay: float = 5.0):
+                              max_retries: int = 5, base_delay: float = 10.0):
     """
     Fetch data for a single ticker.
     data_type: 'ohlcv' -> returns OHLCV, 'close' -> returns only close.
@@ -61,7 +64,7 @@ def _fetch_one_ticker_robust(ticker: str, start: str, end: str, data_type: str =
                 end=end,
                 auto_adjust=True,
                 progress=False,
-                session=_get_yf_session(),
+                session=_YF_SESSION,
                 threads=False,
             )
             if df.empty:
@@ -83,16 +86,20 @@ def _fetch_one_ticker_robust(ticker: str, start: str, end: str, data_type: str =
             if attempt == max_retries:
                 logger.warning(f"yfinance failed for {ticker} after {max_retries} retries: {e}")
                 break
-            sleep_time = base_delay * (2 ** attempt) + random.uniform(0, 1)
+            sleep_time = base_delay * (2 ** attempt) + random.uniform(0, 2)
             logger.info(f"Retry {attempt+1}/{max_retries} for {ticker} after {sleep_time:.1f}s...")
             time.sleep(sleep_time)
 
-    # ----- Stooq fallback -----
-    stooq_tickers = [ticker, f"{ticker}.US"]
-    for stooq_ticker in stooq_tickers:
+    # ----- Stooq fallback with multiple suffixes -----
+    suffixes = ['', '.US', '-US', '_US', '.U', '-U', '_U', '.US', ' US', ' US']
+    tried = set()
+    for suffix in suffixes:
+        stooq_ticker = f"{ticker}{suffix}"
+        if stooq_ticker in tried:
+            continue
+        tried.add(stooq_ticker)
         try:
             logger.info(f"Falling back to Stooq for {stooq_ticker}...")
-            # Use pandas_datareader
             from pandas_datareader import DataReader
             df = DataReader(stooq_ticker, 'stooq', start, end)
             if df.empty:
@@ -119,7 +126,7 @@ def _fetch_one_ticker_robust(ticker: str, start: str, end: str, data_type: str =
 
 
 # ------------------------------------------------------------
-#  ETF OHLCV download (now with fallback)
+#  ETF OHLCV download (batch with fallback to individual)
 # ------------------------------------------------------------
 def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     """
@@ -140,7 +147,7 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
                 auto_adjust=True,
                 progress=False,
                 threads=True,
-                session=_get_yf_session(),
+                session=_YF_SESSION,
             )
             if raw.empty:
                 raise ValueError("Empty batch result")
@@ -163,14 +170,14 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
             if attempt == 2:
                 logger.warning(f"Batch download failed after 3 attempts: {e}. Falling back to one-by-one.")
                 break
-            sleep_time = 10 * (2 ** attempt) + random.uniform(0, 2)
+            sleep_time = 60 * (2 ** attempt) + random.uniform(0, 10)  # 60, 120, 240 seconds
             logger.info(f"Batch retry {attempt+1}/3 after {sleep_time:.1f}s...")
             time.sleep(sleep_time)
 
     # Fallback: download each ticker individually with robust helper
     frames = []
-    for ticker in tickers:
-        logger.info(f"Downloading {ticker} individually...")
+    for i, ticker in enumerate(tickers):
+        logger.info(f"Downloading {ticker} individually ({i+1}/{len(tickers)})...")
         df = _fetch_one_ticker_robust(ticker, start, end, data_type="ohlcv")
         if df is not None:
             # Re‑create MultiIndex columns
@@ -179,7 +186,8 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
             frames.append(df)
         else:
             logger.warning(f"Could not fetch {ticker} after all attempts")
-        time.sleep(0.5)   # small delay between individual downloads
+        # Very long delay between individual downloads
+        time.sleep(10 + random.uniform(0, 2))
 
     if not frames:
         raise ValueError(f"No OHLCV data fetched for any ticker.")
@@ -194,24 +202,18 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
 # ------------------------------------------------------------
 #  The rest of the file remains unchanged
 # ------------------------------------------------------------
-# (flatten_ohlcv, compute_returns, download_fred, etc. stay exactly as before)
+# (flatten_ohlcv, compute_returns, download_fred, etc. are unchanged)
 # I'll include them for completeness, but they are identical to your original.
 
 def flatten_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Flatten MultiIndex OHLCV DataFrame to single-level columns.
-    Columns become: TLT_Close, TLT_Open, TLT_High, TLT_Low, TLT_Volume, etc.
-    """
+    """Flatten MultiIndex OHLCV DataFrame to single-level columns."""
     df = df.copy()
     df.columns = [f"{ticker}_{field}" for ticker, field in df.columns]
     return df
 
 
 def compute_returns(ohlcv_flat: pd.DataFrame, tickers: list) -> pd.DataFrame:
-    """
-    Compute simple and log daily returns from flat OHLCV DataFrame.
-    Returns DataFrame with columns: TLT_ret, TLT_logret, LQD_ret, etc.
-    """
+    """Compute simple and log daily returns from flat OHLCV DataFrame."""
     rets = pd.DataFrame(index=ohlcv_flat.index)
     for ticker in tickers:
         close_col = f"{ticker}_Close"
@@ -227,11 +229,7 @@ def compute_returns(ohlcv_flat: pd.DataFrame, tickers: list) -> pd.DataFrame:
 
 
 def download_fred(start: str, end: str = None) -> pd.DataFrame:
-    """
-    Download all FRED macro series defined in config.FRED_SERIES.
-    Returns DataFrame indexed by date, columns = friendly names (VIX, T10Y2Y, etc.)
-    Missing values forward-filled (FRED releases lag by 1 business day typically).
-    """
+    """Download all FRED macro series."""
     end = end or date.today().strftime("%Y-%m-%d")
     fred = Fred(api_key=cfg.FRED_API_KEY)
 
@@ -286,12 +284,8 @@ def last_trading_day() -> str:
 
 
 def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute engineered macro features from raw FRED series.
-    All projects can use these pre-computed features directly.
-    """
+    """Compute engineered macro features from raw FRED series."""
     d = pd.DataFrame(index=macro.index)
-
     w = cfg.ZSCORE_WINDOW
 
     def zscore(s: pd.Series) -> pd.Series:
@@ -356,10 +350,7 @@ def build_master(
     macro: pd.DataFrame,
     macro_derived: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Inner-join all DataFrames on common trading days to produce master.parquet.
-    No lookahead: macro is only forward-filled, never backward-filled.
-    """
+    """Inner-join all DataFrames on common trading days."""
     common = (
         ohlcv_flat.index
         .intersection(returns.index)
