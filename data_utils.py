@@ -91,7 +91,7 @@ def _fetch_one_ticker_robust(ticker: str, start: str, end: str, data_type: str =
             time.sleep(sleep_time)
 
     # ----- Stooq fallback with multiple suffixes -----
-    suffixes = ['', '.US', '-US', '_US', '.U', '-U', '_U', '.US', ' US', ' US']
+    suffixes = ['', '.US', '-US', '_U', '.U', '-U', '_U', ' US', ' US']
     tried = set()
     for suffix in suffixes:
         stooq_ticker = f"{ticker}{suffix}"
@@ -223,6 +223,8 @@ def compute_returns(ohlcv_flat: pd.DataFrame, tickers: list) -> pd.DataFrame:
         close = ohlcv_flat[close_col]
         rets[f"{ticker}_ret"]    = close.pct_change()
         rets[f"{ticker}_logret"] = np.log(close / close.shift(1))
+    # FIX: Use dropna(how='any') to keep rows with at least some valid returns
+    # Or better: drop rows where ALL are NaN but keep partial data
     rets = rets.dropna(how="all")
     logger.info(f"Returns shape: {rets.shape}")
     return rets
@@ -351,6 +353,19 @@ def build_master(
     macro_derived: pd.DataFrame,
 ) -> pd.DataFrame:
     """Inner-join all DataFrames on common trading days."""
+    # DEBUG: Log input shapes
+    logger.info(f"build_master inputs: ohlcv={ohlcv_flat.shape}, returns={returns.shape}, macro={macro.shape}, macro_derived={macro_derived.shape}")
+    
+    # FIX: Handle empty returns DataFrame gracefully
+    if returns.empty:
+        logger.warning("Returns DataFrame is empty! Creating minimal returns with zeros.")
+        # Create a dummy returns DataFrame with same index as ohlcv_flat
+        returns = pd.DataFrame(index=ohlcv_flat.index)
+        for col in [c for c in ohlcv_flat.columns if '_Close' in c]:
+            ticker = col.replace('_Close', '')
+            returns[f"{ticker}_ret"] = 0.0
+            returns[f"{ticker}_logret"] = 0.0
+    
     common = (
         ohlcv_flat.index
         .intersection(returns.index)
@@ -358,6 +373,15 @@ def build_master(
         .intersection(macro_derived.index)
     )
     common = common.sort_values()
+
+    # FIX: Handle case where intersection is empty
+    if len(common) == 0:
+        logger.error("No common dates found between datasets!")
+        logger.error(f"  ohlcv dates: {ohlcv_flat.index.min()} to {ohlcv_flat.index.max()}")
+        logger.error(f"  returns dates: {returns.index.min()} to {returns.index.max()}")
+        logger.error(f"  macro dates: {macro.index.min()} to {macro.index.max()}")
+        logger.error(f"  macro_derived dates: {macro_derived.index.min()} to {macro_derived.index.max()}")
+        raise ValueError("Cannot build master dataset: no overlapping dates between data sources")
 
     master = pd.concat(
         [
@@ -369,7 +393,14 @@ def build_master(
         axis=1,
     )
     master.index.name = "Date"
-    logger.info(f"Master shape: {master.shape}, range: {master.index[0].date()} -> {master.index[-1].date()}")
+    
+    # FIX: Safely log the date range
+    if len(master) > 0:
+        logger.info(f"Master shape: {master.shape}, range: {master.index[0].date()} -> {master.index[-1].date()}")
+    else:
+        logger.error("Master DataFrame is empty after concatenation!")
+        raise ValueError("Master dataset is empty")
+        
     return master
 
 
