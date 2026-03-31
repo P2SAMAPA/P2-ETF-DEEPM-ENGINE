@@ -298,10 +298,10 @@ def update_master(debug=False):
                 log.info("DEBUG: Simulating atomic update (will not upload)")
                 ohlcv_updated, macro_updated = atomic_update(target_date, ohlcv, macro, debug=True)
                 update_performed = True
-                # Log what would be uploaded
+                # FIXED: Use the returned DataFrames instead of undefined variables
                 log.info(f"Would upload OHLCV row for {target_date.date()}")
-                log.info(f"OHLCV row columns count: {len(new_ohlcv_row.columns)}")
-                log.info(f"Macro row columns count: {len(new_macro.columns)}")
+                log.info(f"OHLCV shape after update: {ohlcv_updated.shape}")
+                log.info(f"Macro shape after update: {macro_updated.shape}")
             else:
                 ohlcv_updated, macro_updated = atomic_update(target_date, ohlcv, macro)
                 update_performed = True
