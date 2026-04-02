@@ -1,8 +1,7 @@
 # data_utils.py — Shared data download, transform and HuggingFace I/O
-# FIX: Replaced broken per-ticker yfinance + dead pandas_datareader Stooq
-#      with: (1) yfinance batch download (single crumb, far fewer requests)
+# FIX: Removed Alpha Vantage entirely, improved yfinance rate limit handling
+#      with: (1) yfinance batch download with exponential backoff + smaller chunks
 #            (2) direct HTTP Stooq fallback (bypasses pandas_datareader)
-#            (3) Alpha Vantage fallback (optional, set AV_API_KEY secret)
 
 import io
 import json
@@ -27,6 +26,11 @@ import config as cfg
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
+# Rate limit tuning
+MAX_BATCH_RETRIES = 5
+BATCH_CHUNK_SIZE = 3  # Download 3 tickers at a time to avoid rate limits
+REQUEST_DELAY = 2  # Seconds between requests
+
 # ─────────────────────────────────────────────────────────────
 # Shared requests session
 # ─────────────────────────────────────────────────────────────
@@ -41,7 +45,6 @@ def _make_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    # Rotate a realistic browser UA so Yahoo doesn't block on UA alone
     session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -57,72 +60,82 @@ _SESSION = _make_session()
 
 
 # ─────────────────────────────────────────────────────────────
-# PRIMARY: yfinance batch download (single crumb → fewest hits)
+# PRIMARY: yfinance chunked download (smaller chunks = less rate limiting)
 # ─────────────────────────────────────────────────────────────
-def _yfinance_batch(tickers: list, start: str, end: str,
-                    max_attempts: int = 4) -> pd.DataFrame | None:
+def _yfinance_chunked(tickers: list, start: str, end: str,
+                      max_attempts: int = MAX_BATCH_RETRIES) -> tuple:
     """
-    Download all tickers in one yfinance call.
-    Returns MultiIndex DataFrame (ticker, field) or None.
-    Retries with exponential backoff + jitter.
+    Download tickers in small chunks with exponential backoff.
+    Returns (data_dict, successful_list, failed_list)
     """
-    for attempt in range(1, max_attempts + 1):
-        try:
-            logger.info(f"yfinance batch attempt {attempt}/{max_attempts} "
-                        f"for {len(tickers)} tickers ({start}→{end})")
-            # Use a fresh Ticker list object — avoids stale crumb issues
-            data = yf.download(
-                tickers=" ".join(tickers),
-                start=start,
-                end=end,
-                auto_adjust=True,
-                progress=False,
-                threads=False,      # single thread = single crumb request
-                group_by="ticker",  # MultiIndex: (ticker, field)
-            )
-            if data is None or data.empty:
-                raise ValueError("Empty response from yfinance batch")
-
-            # yfinance returns (field, ticker) MultiIndex when group_by="ticker"
-            # for a single ticker it collapses — handle both cases
-            if isinstance(data.columns, pd.MultiIndex):
-                # Swap to (ticker, field)
-                data.columns = data.columns.swaplevel(0, 1)
-                data.sort_index(axis=1, inplace=True)
-            else:
-                # Single ticker fell through — wrap it
-                if len(tickers) == 1:
-                    data.columns = pd.MultiIndex.from_tuples(
-                        [(tickers[0], c) for c in data.columns],
-                        names=["Ticker", "Field"]
-                    )
-
-            data.index = pd.to_datetime(data.index).tz_localize(None)
-            data.sort_index(inplace=True)
-
-            # Check coverage — warn but don't fail for missing tickers
-            got = data.columns.get_level_values(0).unique().tolist()
-            missing = [t for t in tickers if t not in got]
-            if missing:
-                logger.warning(f"yfinance batch missing: {missing}")
-            if len(got) == 0:
-                raise ValueError("No tickers in batch response")
-
-            logger.info(f"yfinance batch OK: {len(got)}/{len(tickers)} tickers")
-            return data
-
-        except Exception as exc:
-            logger.warning(f"yfinance batch attempt {attempt} failed: {exc}")
-            if attempt < max_attempts:
-                sleep = 30 * attempt + random.uniform(0, 15)
-                logger.info(f"Sleeping {sleep:.0f}s before retry...")
-                time.sleep(sleep)
-
-    return None
+    all_data = {}
+    successful = []
+    failed = []
+    
+    for i in range(0, len(tickers), BATCH_CHUNK_SIZE):
+        chunk = tickers[i:i+BATCH_CHUNK_SIZE]
+        chunk_success = False
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                delay = 30 * (2 ** (attempt - 1)) + random.uniform(0, 10)
+                if attempt > 1:
+                    logger.info(f"  Retry {attempt}/{max_attempts} for {chunk} after {delay:.0f}s...")
+                    time.sleep(delay)
+                
+                data = yf.download(
+                    chunk,
+                    start=start,
+                    end=end,
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,  # Single thread = fewer requests
+                )
+                
+                if data is not None and not data.empty:
+                    # Handle both single and multi-ticker responses
+                    if len(chunk) == 1:
+                        # Single ticker returns simple DataFrame
+                        data.columns = pd.MultiIndex.from_tuples(
+                            [(chunk[0], c) for c in data.columns],
+                            names=["Ticker", "Field"]
+                        )
+                        all_data[chunk[0]] = data
+                    else:
+                        # Multi-ticker returns MultiIndex
+                        if isinstance(data.columns, pd.MultiIndex):
+                            # Ensure (ticker, field) format
+                            if data.columns.names[0] != "Ticker":
+                                data.columns = data.columns.swaplevel(0, 1)
+                            for ticker in chunk:
+                                if ticker in data.columns.get_level_values(0):
+                                    ticker_data = data[ticker].dropna(how="all")
+                                    if not ticker_data.empty:
+                                        all_data[ticker] = ticker_data
+                    successful.extend(chunk)
+                    chunk_success = True
+                    logger.info(f"  ✓ {chunk} downloaded (attempt {attempt})")
+                    break
+                    
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "rate" in error_msg or "too many" in error_msg:
+                    logger.warning(f"  Rate limited for {chunk}, backing off...")
+                else:
+                    logger.debug(f"  Attempt {attempt} failed for {chunk}: {e}")
+        
+        if not chunk_success:
+            failed.extend(chunk)
+            logger.warning(f"  ✗ {chunk} failed after {max_attempts} attempts")
+        
+        # Pause between chunks to avoid rate limits
+        time.sleep(REQUEST_DELAY * 2)
+    
+    return all_data, successful, failed
 
 
 # ─────────────────────────────────────────────────────────────
-# FALLBACK A: direct HTTP to Stooq (bypasses pandas_datareader)
+# FALLBACK: direct HTTP to Stooq (ONLY fallback - no Alpha Vantage)
 # ─────────────────────────────────────────────────────────────
 def _stooq_direct(ticker: str, start: str, end: str) -> pd.DataFrame | None:
     """
@@ -134,58 +147,28 @@ def _stooq_direct(ticker: str, start: str, end: str) -> pd.DataFrame | None:
         f"https://stooq.com/q/d/l/"
         f"?s={symbol}&d1={start.replace('-','')}&d2={end.replace('-','')}&i=d"
     )
-    try:
-        resp = _SESSION.get(url, timeout=30)
-        resp.raise_for_status()
-        content = resp.text.strip()
-        if not content or "No data" in content or len(content) < 50:
-            return None
-        df = pd.read_csv(io.StringIO(content), parse_dates=["Date"], index_col="Date")
-        if df.empty:
-            return None
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        df = df.sort_index()
-        # Stooq columns: Open, High, Low, Close, Volume
-        df.columns = [c.capitalize() for c in df.columns]
-        logger.info(f"Stooq direct OK for {ticker}: {len(df)} rows")
-        return df
-    except Exception as e:
-        logger.debug(f"Stooq direct failed for {ticker}: {e}")
-        return None
-
-
-# ─────────────────────────────────────────────────────────────
-# FALLBACK B: Alpha Vantage (optional — set AV_API_KEY secret)
-# ─────────────────────────────────────────────────────────────
-def _alpha_vantage(ticker: str, start: str, end: str) -> pd.DataFrame | None:
-    av_key = os.environ.get("AV_API_KEY", "")
-    if not av_key:
-        return None
-    url = (
-        "https://www.alphavantage.co/query"
-        f"?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker}"
-        f"&outputsize=full&apikey={av_key}&datatype=csv"
-    )
-    try:
-        resp = _SESSION.get(url, timeout=60)
-        resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text), parse_dates=["timestamp"],
-                         index_col="timestamp")
-        if df.empty:
-            return None
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        df = df.rename(columns={
-            "open": "Open", "high": "High", "low": "Low",
-            "adjusted_close": "Close", "volume": "Volume"
-        })
-        df = df[["Open", "High", "Low", "Close", "Volume"]]
-        mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
-        df = df.loc[mask].sort_index()
-        logger.info(f"Alpha Vantage OK for {ticker}: {len(df)} rows")
-        return df
-    except Exception as e:
-        logger.debug(f"Alpha Vantage failed for {ticker}: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            resp = _SESSION.get(url, timeout=30)
+            resp.raise_for_status()
+            content = resp.text.strip()
+            if not content or "No data" in content or len(content) < 50:
+                return None
+            df = pd.read_csv(io.StringIO(content), parse_dates=["Date"], index_col="Date")
+            if df.empty:
+                return None
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            df = df.sort_index()
+            # Stooq columns: Open, High, Low, Close, Volume
+            df.columns = [c.capitalize() for c in df.columns]
+            logger.info(f"  Stooq OK for {ticker}: {len(df)} rows")
+            return df
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            logger.debug(f"Stooq failed for {ticker}: {e}")
+    return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -193,22 +176,24 @@ def _alpha_vantage(ticker: str, start: str, end: str) -> pd.DataFrame | None:
 # ─────────────────────────────────────────────────────────────
 def _rescue_tickers(missing: list, start: str, end: str) -> dict:
     """
-    Try Stooq → Alpha Vantage for each missing ticker.
+    Try Stooq only (no Alpha Vantage) for each missing ticker.
     Returns {ticker: DataFrame(OHLCV)} for successes.
     """
     recovered = {}
-    for ticker in missing:
+    for idx, ticker in enumerate(missing):
         logger.info(f"Rescuing {ticker} via Stooq direct...")
+        
+        # Progressive delay between rescue attempts
+        if idx > 0:
+            time.sleep(REQUEST_DELAY)
+        
         df = _stooq_direct(ticker, start, end)
-        if df is None or df.empty:
-            logger.info(f"Stooq failed, trying Alpha Vantage for {ticker}...")
-            df = _alpha_vantage(ticker, start, end)
         if df is not None and not df.empty:
             recovered[ticker] = df
-            logger.info(f"Recovered {ticker}: {len(df)} rows")
+            logger.info(f"  ✓ Recovered {ticker}: {len(df)} rows")
         else:
-            logger.warning(f"All sources failed for {ticker} — will be NaN")
-        time.sleep(random.uniform(1.0, 3.0))
+            logger.warning(f"  ✗ All sources failed for {ticker} — will be NaN")
+    
     return recovered
 
 
@@ -224,22 +209,26 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     # CASH is synthetic (from FRED DTB3) — skip for market data download
     market_tickers = [t for t in tickers if t != "CASH"]
     logger.info(f"Downloading OHLCV: {len(market_tickers)} tickers {start}→{end}")
+    logger.info(f"Chunk size: {BATCH_CHUNK_SIZE}, max retries: {MAX_BATCH_RETRIES}")
 
-    # Step 1: yfinance batch (most efficient — single crumb)
-    batch_result = _yfinance_batch(market_tickers, start, end)
+    # Step 1: yfinance chunked download (reduced rate limit impact)
+    yf_data, yf_success, yf_failed = _yfinance_chunked(market_tickers, start, end)
+    
+    logger.info(f"yfinance success: {len(yf_success)}/{len(market_tickers)} tickers")
+    if yf_failed:
+        logger.info(f"yfinance failed: {yf_failed}")
 
-    frames_multi = []  # list of (MultiIndex DataFrame per ticker)
-    rescued_tickers = market_tickers[:]
-
-    if batch_result is not None and not batch_result.empty:
-        frames_multi.append(batch_result)
-        got = batch_result.columns.get_level_values(0).unique().tolist()
-        rescued_tickers = [t for t in market_tickers if t not in got]
-
-    # Step 2: per-ticker rescue for anything still missing
-    if rescued_tickers:
-        logger.info(f"Rescuing {len(rescued_tickers)} missing tickers: {rescued_tickers}")
-        recovered = _rescue_tickers(rescued_tickers, start, end)
+    # Step 2: per-ticker Stooq rescue for anything still missing
+    frames_multi = []
+    
+    # Add successful yfinance data
+    for ticker, df in yf_data.items():
+        frames_multi.append(df)
+    
+    # Rescue missing tickers
+    if yf_failed:
+        logger.info(f"Rescuing {len(yf_failed)} missing tickers...")
+        recovered = _rescue_tickers(yf_failed, start, end)
         for ticker, df in recovered.items():
             keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
             df = df[keep]
@@ -251,15 +240,18 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     if not frames_multi:
         raise ValueError(
             "No OHLCV data fetched for any ticker. "
-            "yfinance is rate-limited and all fallbacks failed. "
-            "Consider adding AV_API_KEY secret (free at alphavantage.co) "
-            "or re-running the workflow later."
+            "yfinance is rate-limited and Stooq fallback failed. "
+            "Try: 1) Re-run later (off-peak hours), or "
+            "2) Increase BATCH_CHUNK_SIZE and MAX_BATCH_RETRIES in data_utils.py"
         )
 
     combined = pd.concat(frames_multi, axis=1)
     combined.index = pd.to_datetime(combined.index).tz_localize(None)
     combined.sort_index(inplace=True)
     combined.sort_index(axis=1, inplace=True)
+    
+    # Forward fill any missing values
+    combined = combined.ffill()
 
     logger.info(f"OHLCV download complete. Shape: {combined.shape}")
     return combined
