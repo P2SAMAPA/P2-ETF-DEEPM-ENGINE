@@ -1,11 +1,11 @@
-# data_utils.py — Updated with robust rate-limit handling
+# data_utils.py — Updated with HURST-repo style sequential download + Stooq fallback
 import io
 import json
 import logging
 import os
 import random
 import time
-import warnings
+import re
 from datetime import date, datetime, timedelta
 
 import numpy as np
@@ -14,220 +14,180 @@ import pandas_market_calendars as mcal
 import yfinance as yf
 from fredapi import Fred
 from huggingface_hub import HfApi, hf_hub_download
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 import config as cfg
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-# ------------------------------------------------------------
-# Session factory — rotate user agents to avoid detection
-# ------------------------------------------------------------
-def _create_session() -> requests.Session:
-    """Create a session with browser-like headers to avoid bot detection."""
-    session = requests.Session()
-    
-    # Rotate user agents
-    user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-    ]
-    
-    session.headers.update({
-        'User-Agent': random.choice(user_agents),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    })
-    
-    # Mount retry adapter for connection errors (not for yfinance logic errors)
-    adapter = HTTPAdapter(max_retries=Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-    ))
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    
-    return session
+OHLCV_FIELDS = ["Open", "High", "Low", "Close", "Volume"]
 
 # ------------------------------------------------------------
-# ETF OHLCV download — sequential with aggressive delays
+# OHLCV download — Sequential single-ticker with exponential backoff
 # ------------------------------------------------------------
+
 def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     """
-    Download OHLCV with aggressive rate-limit handling.
-    Strategy: Try batch first with long delays, fallback to sequential if needed.
+    Download OHLCV using HURST-style sequential approach with exponential backoff.
+    This avoids YF rate limits better than batch downloads from cloud IPs.
     """
     end = end or date.today().strftime("%Y-%m-%d")
     yf_tickers = [t for t in tickers if t != "CASH"]
     
-    logger.info(f"Downloading OHLCV: {len(yf_tickers)} tickers {start}→{end}")
+    logger.info(f"Downloading OHLCV (sequential): {len(yf_tickers)} tickers {start}→{end}")
     
-    # Strategy 1: Try batch download with aggressive backoff (but threads=False to avoid DB locks)
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
+    frames = []
+    failed = []
+    
+    for i, ticker in enumerate(yf_tickers):
+        logger.info(f"[{i+1}/{len(yf_tickers)}] Fetching {ticker}...")
+        
+        # Try Yahoo Finance first
+        df = _fetch_yf_single(ticker, start, end)
+        
+        # Fallback to Stooq if YF fails
+        if df is None:
+            logger.warning(f"🔄 YF failed for {ticker}, trying Stooq fallback...")
+            df = _fetch_stooq_single(ticker, start, end)
+        
+        if df is not None:
+            frames.append(df)
+        else:
+            failed.append(ticker)
+            logger.error(f"❌ All sources failed for {ticker}")
+        
+        # Polite delay between tickers (critical for avoiding rate limits)
+        if i < len(yf_tickers) - 1:
+            delay = random.uniform(1.0, 2.5)
+            time.sleep(delay)
+    
+    if not frames:
+        raise ValueError("No data fetched from any source for any ticker.")
+    
+    if failed:
+        logger.warning(f"⚠️ Failed tickers: {failed} — continuing with {len(frames)} tickers.")
+    
+    # Combine all tickers into MultiIndex DataFrame
+    combined = pd.concat(frames, axis=1)
+    combined = combined.sort_index()
+    combined = combined[~combined.index.duplicated(keep="last")]
+    combined = combined.ffill()
+    
+    logger.info(f"OHLCV download complete. Shape: {combined.shape}")
+    return combined
+
+def _fetch_yf_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
+    """Fetch single ticker from Yahoo Finance with exponential backoff."""
+    for attempt in range(6):  # 0-5 attempts
         try:
-            # Clear yfinance cache to avoid DB locks
-            yf.shared._DFS = {}
-            yf.shared._ERRORS = {}
-            
-            # Use session with custom headers
-            session = _create_session()
-            
-            # threads=False is crucial - prevents SQLite concurrency issues
+            # CRITICAL: threads=False prevents SQLite DB locks
             raw = yf.download(
-                yf_tickers,
+                ticker,
                 start=start,
                 end=end,
-                auto_adjust=True,
                 progress=False,
-                threads=False,  # CRITICAL: Prevents 'database is locked' errors
-                prepost=False,  # Reduce data size/request time
-                session=session,
+                auto_adjust=True,
+                threads=False,
             )
             
             if raw is None or raw.empty:
-                raise ValueError("yfinance returned empty DataFrame")
+                raise ValueError(f"Empty response for {ticker}")
             
-            combined = _normalize_columns(raw, yf_tickers)
-            logger.info(f"Batch download success: {len(yf_tickers)} tickers")
-            return combined
+            # Flatten MultiIndex columns if present (yfinance sometimes returns MultiIndex)
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = [col[0] for col in raw.columns]
+            
+            # Keep only OHLCV fields
+            available = [f for f in OHLCV_FIELDS if f in raw.columns]
+            if not available:
+                raise ValueError(f"No OHLCV columns found for {ticker}")
+            
+            df = raw[available].copy()
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            
+            # Create MultiIndex columns: (ticker, field)
+            df.columns = pd.MultiIndex.from_tuples(
+                [(ticker, f) for f in df.columns],
+                names=["Ticker", "Field"]
+            )
+            
+            logger.info(f"✅ {ticker} (YF): {len(df)} rows")
+            return df
             
         except Exception as e:
-            error_str = str(e)
-            if "Rate limited" in error_str or "Too Many Requests" in error_str:
-                # Aggressive backoff: 60s, 120s, 180s + jitter
-                wait = 60 * attempt + random.uniform(10, 30)
-                logger.warning(f"Rate limited on attempt {attempt}/{max_retries}. Waiting {wait:.0f}s...")
+            err_str = str(e).lower()
+            is_rate_limit = any(k in err_str for k in ["rate limit", "too many", "429", "ratelimit"])
+            
+            if is_rate_limit and attempt < 5:
+                # Exponential backoff: 30s, 60s, 120s, 240s, 480s + jitter
+                wait = 30 * (2 ** attempt) + random.randint(5, 15)
+                logger.warning(f"⚠️ YF rate limited on {ticker} (attempt {attempt+1}). Waiting {wait}s...")
                 time.sleep(wait)
             else:
-                logger.warning(f"Batch attempt {attempt}/{max_retries} failed: {e}")
-                if attempt < max_retries:
-                    wait = 30 * attempt + random.uniform(5, 15)
-                    time.sleep(wait)
+                logger.warning(f"❌ YF failed for {ticker} after {attempt+1} attempts: {e}")
+                return None
     
-    # Strategy 2: Fallback to sequential single-ticker downloads with delays
-    logger.warning("Batch failed, falling back to sequential single-ticker downloads...")
-    return _download_sequential(yf_tickers, start, end)
+    return None
 
-def _download_sequential(tickers: list, start: str, end: str) -> pd.DataFrame:
-    """
-    Download tickers one by one with generous delays between each.
-    This is slower but respects rate limits better than batch from cloud IPs.
-    """
-    all_data = {}
-    failed_tickers = []
+def _fetch_stooq_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
+    """Fetch single ticker from Stooq as fallback (no API key required)."""
+    stooq_symbol = ticker.lower() + ".us"
+    url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
     
-    for i, ticker in enumerate(tickers):
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # Clear cache before each ticker to prevent DB locks
-                yf.shared._DFS = {}
-                yf.shared._ERRORS = {}
-                
-                session = _create_session()
-                
-                # Download single ticker
-                ticker_obj = yf.Ticker(ticker, session=session)
-                hist = ticker_obj.history(
-                    start=start, 
-                    end=end, 
-                    auto_adjust=True, 
-                    prepost=False
-                )
-                
-                if hist is not None and not hist.empty:
-                    all_data[ticker] = hist
-                    logger.info(f"[{i+1}/{len(tickers)}] {ticker}: {len(hist)} rows")
-                    break
-                else:
-                    raise ValueError("Empty data")
-                    
-            except Exception as e:
-                if "Rate limited" in str(e) or "Too Many Requests" in str(e):
-                    wait = 60 + random.uniform(10, 30)  # 60-90s delay on rate limit
-                    logger.warning(f"{ticker} rate limited, waiting {wait:.0f}s...")
-                    time.sleep(wait)
-                else:
-                    logger.warning(f"{ticker} attempt {attempt+1} failed: {e}")
-                    if attempt < max_retries - 1:
-                        time.sleep(5)
-        
-        if ticker not in all_data:
-            failed_tickers.append(ticker)
-            logger.error(f"Failed to download {ticker} after all retries")
-        
-        # Delay between tickers: 2-5 seconds (randomized to look less robotic)
-        if i < len(tickers) - 1:
-            delay = random.uniform(2, 5)
-            time.sleep(delay)
+    for attempt in range(3):
+        try:
+            raw = pd.read_csv(url, parse_dates=["Date"], index_col="Date")
+            
+            if raw.empty:
+                raise ValueError(f"Empty Stooq response for {ticker}")
+            
+            raw = raw.sort_index()
+            
+            # Filter date range
+            mask = (raw.index >= start) & (raw.index <= end)
+            raw = raw.loc[mask]
+            
+            if raw.empty:
+                raise ValueError(f"No data in range for {ticker} from Stooq")
+            
+            # Stooq returns: Open, High, Low, Close, Volume
+            available = [f for f in OHLCV_FIELDS if f in raw.columns]
+            df = raw[available].copy()
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            
+            # Create MultiIndex columns
+            df.columns = pd.MultiIndex.from_tuples(
+                [(ticker, f) for f in df.columns],
+                names=["Ticker", "Field"]
+            )
+            
+            logger.info(f"✅ {ticker} (Stooq): {len(df)} rows")
+            return df
+            
+        except Exception as e:
+            if attempt < 2:
+                wait = 5 * (2 ** attempt) + random.randint(1, 5)
+                logger.warning(f"⚠️ Stooq attempt {attempt+1} failed for {ticker}: {e}. Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                logger.error(f"❌ Stooq failed for {ticker} after 3 attempts.")
+                return None
     
-    if not all_data:
-        raise ValueError("All tickers failed to download")
-    
-    # Combine all single-ticker DataFrames into MultiIndex format
-    combined = pd.concat(all_data, axis=1)
-    
-    if isinstance(combined.columns, pd.MultiIndex):
-        combined.columns.names = ["Ticker", "Field"]
-    else:
-        # Single column level - create MultiIndex
-        cols = [(ticker, col) for ticker, df in all_data.items() for col in df.columns]
-        combined.columns = pd.MultiIndex.from_tuples(cols, names=["Ticker", "Field"])
-    
-    combined.index = pd.to_datetime(combined.index).tz_localize(None)
-    combined.sort_index(inplace=True)
-    
-    if failed_tickers:
-        logger.warning(f"Missing tickers: {failed_tickers}")
-    
-    logger.info(f"Sequential download complete. Shape: {combined.shape}")
-    return combined
-
-def _normalize_columns(raw: pd.DataFrame, tickers: list) -> pd.DataFrame:
-    """Normalize yfinance output to consistent MultiIndex (Ticker, Field)."""
-    if isinstance(raw.columns, pd.MultiIndex):
-        lvl0 = raw.columns.get_level_values(0).unique().tolist()
-        
-        if any(t in lvl0 for t in tickers):
-            # Already (ticker, field) order
-            combined = raw.copy()
-            combined.columns.names = ["Ticker", "Field"]
-        else:
-            # (field, ticker) order — swap
-            combined = raw.swaplevel(axis=1).sort_index(axis=1)
-            combined.columns.names = ["Ticker", "Field"]
-    else:
-        # Single-ticker fallback
-        ticker = tickers[0]
-        combined = raw.copy()
-        combined.columns = pd.MultiIndex.from_tuples(
-            [(ticker, col) for col in combined.columns],
-            names=["Ticker", "Field"],
-        )
-    
-    combined.index = pd.to_datetime(combined.index).tz_localize(None)
-    combined.sort_index(inplace=True)
-    return combined
+    return None
 
 # ------------------------------------------------------------
-# flatten_ohlcv — unchanged
+# flatten_ohlcv — Updated to handle HURST-style MultiIndex
 # ------------------------------------------------------------
+
 def flatten_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """Flatten MultiIndex OHLCV DataFrame to single-level columns like TLT_Close."""
+    """
+    Flatten MultiIndex OHLCV DataFrame to single-level columns like TLT_Close.
+    Handles both (Ticker, Field) MultiIndex and already-flat formats.
+    """
     df = df.copy()
 
     if isinstance(df.columns, pd.MultiIndex):
+        # Handle (Ticker, Field) format
         lvl0 = df.columns.get_level_values(0).tolist()
         lvl1 = df.columns.get_level_values(1).tolist()
 
@@ -236,18 +196,25 @@ def flatten_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         for i, (t, f) in enumerate(zip(lvl0, lvl1)):
             t = str(t).strip()
             f = str(f).strip()
-            if t and f and t != "nan" and f != "nan":
+            if t and f and t.lower() != "nan" and f.lower() != "nan":
                 new_cols.append(f"{t}_{f}")
                 keep.append(i)
 
         df = df.iloc[:, keep]
         df.columns = new_cols
+    else:
+        # Handle flat columns - check if already formatted as Ticker_Field
+        cols = df.columns.tolist()
+        # If columns look like "TLT_Close", we're good
+        # If columns are just field names, we need to infer ticker (shouldn't happen)
+        pass
 
     return df
 
 # ------------------------------------------------------------
-# Returns computation — unchanged
+# Returns computation — Unchanged
 # ------------------------------------------------------------
+
 def compute_returns(ohlcv_flat: pd.DataFrame, tickers: list) -> pd.DataFrame:
     """Compute simple and log daily returns from flat OHLCV DataFrame."""
     rets = pd.DataFrame(index=ohlcv_flat.index)
@@ -267,8 +234,9 @@ def compute_returns(ohlcv_flat: pd.DataFrame, tickers: list) -> pd.DataFrame:
     return rets
 
 # ------------------------------------------------------------
-# FRED download — unchanged
+# FRED download — Unchanged
 # ------------------------------------------------------------
+
 def download_fred(start: str, end: str = None) -> pd.DataFrame:
     """Download all FRED macro series."""
     end = end or date.today().strftime("%Y-%m-%d")
@@ -297,8 +265,9 @@ def download_fred(start: str, end: str = None) -> pd.DataFrame:
     return df
 
 # ------------------------------------------------------------
-# Calendar helpers — unchanged
+# Calendar helpers — Unchanged
 # ------------------------------------------------------------
+
 def get_trading_days(start: str, end: str = None) -> pd.DatetimeIndex:
     """Return NYSE trading days between start and end (inclusive)."""
     nyse = mcal.get_calendar("NYSE")
@@ -322,8 +291,9 @@ def last_trading_day() -> str:
     return latest.strftime("%Y-%m-%d")
 
 # ------------------------------------------------------------
-# Derived macro features — unchanged
+# Derived macro features — Unchanged
 # ------------------------------------------------------------
+
 def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
     """Compute engineered macro features from raw FRED series."""
     d = pd.DataFrame(index=macro.index)
@@ -385,8 +355,9 @@ def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
     return d
 
 # ------------------------------------------------------------
-# build_master — unchanged
+# build_master — Unchanged
 # ------------------------------------------------------------
+
 def build_master(
     ohlcv_flat: pd.DataFrame,
     returns: pd.DataFrame,
@@ -434,8 +405,9 @@ def build_master(
     return master
 
 # ------------------------------------------------------------
-# HuggingFace I/O — unchanged
+# HuggingFace I/O — Unchanged
 # ------------------------------------------------------------
+
 def _df_to_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     df.to_parquet(buf, index=True, engine="pyarrow")
