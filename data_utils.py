@@ -33,42 +33,42 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     """
     end = end or date.today().strftime("%Y-%m-%d")
     yf_tickers = [t for t in tickers if t != "CASH"]
-    
+
     logger.info(f"Downloading OHLCV (sequential): {len(yf_tickers)} tickers {start}→{end}")
-    
+
     frames = []
     failed = []
-    
+
     for i, ticker in enumerate(yf_tickers):
         logger.info(f"[{i+1}/{len(yf_tickers)}] Fetching {ticker}...")
-        
+
         df = _fetch_yf_single(ticker, start, end)
-        
+
         if df is None:
             logger.warning(f"🔄 YF failed for {ticker}, trying Stooq fallback...")
             df = _fetch_stooq_single(ticker, start, end)
-        
+
         if df is not None:
             frames.append(df)
         else:
             failed.append(ticker)
             logger.error(f"❌ All sources failed for {ticker}")
-        
+
         if i < len(yf_tickers) - 1:
             delay = random.uniform(1.0, 2.5)
             time.sleep(delay)
-    
+
     if not frames:
         raise ValueError("No data fetched from any source for any ticker.")
-    
+
     if failed:
         logger.warning(f"⚠️ Failed tickers: {failed} — continuing with {len(frames)} tickers.")
-    
+
     combined = pd.concat(frames, axis=1)
     combined = combined.sort_index()
     combined = combined[~combined.index.duplicated(keep="last")]
     combined = combined.ffill()
-    
+
     logger.info(f"OHLCV download complete. Shape: {combined.shape}")
     return combined
 
@@ -85,32 +85,32 @@ def _fetch_yf_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
                 auto_adjust=True,
                 threads=False,
             )
-            
+
             if raw is None or raw.empty:
                 raise ValueError(f"Empty response for {ticker}")
-            
+
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = [col[0] for col in raw.columns]
-            
+
             available = [f for f in OHLCV_FIELDS if f in raw.columns]
             if not available:
                 raise ValueError(f"No OHLCV columns found for {ticker}")
-            
+
             df = raw[available].copy()
             df.index = pd.to_datetime(df.index).tz_localize(None)
-            
+
             df.columns = pd.MultiIndex.from_tuples(
                 [(ticker, f) for f in df.columns],
                 names=["Ticker", "Field"]
             )
-            
+
             logger.info(f"✅ {ticker} (YF): {len(df)} rows")
             return df
-            
+
         except Exception as e:
             err_str = str(e).lower()
             is_rate_limit = any(k in err_str for k in ["rate limit", "too many", "429", "ratelimit"])
-            
+
             if is_rate_limit and attempt < 5:
                 wait = 30 * (2 ** attempt) + random.randint(5, 15)
                 logger.warning(f"⚠️ YF rate limited on {ticker} (attempt {attempt+1}). Waiting {wait}s...")
@@ -118,7 +118,7 @@ def _fetch_yf_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
             else:
                 logger.warning(f"❌ YF failed for {ticker} after {attempt+1} attempts: {e}")
                 return None
-    
+
     return None
 
 
@@ -126,33 +126,33 @@ def _fetch_stooq_single(ticker: str, start: str, end: str) -> pd.DataFrame | Non
     """Fetch single ticker from Stooq as fallback (no API key required)."""
     stooq_symbol = ticker.lower() + ".us"
     url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
-    
+
     for attempt in range(3):
         try:
             raw = pd.read_csv(url, parse_dates=["Date"], index_col="Date")
-            
+
             if raw.empty:
                 raise ValueError(f"Empty Stooq response for {ticker}")
-            
+
             raw = raw.sort_index()
             mask = (raw.index >= start) & (raw.index <= end)
             raw = raw.loc[mask]
-            
+
             if raw.empty:
                 raise ValueError(f"No data in range for {ticker} from Stooq")
-            
+
             available = [f for f in OHLCV_FIELDS if f in raw.columns]
             df = raw[available].copy()
             df.index = pd.to_datetime(df.index).tz_localize(None)
-            
+
             df.columns = pd.MultiIndex.from_tuples(
                 [(ticker, f) for f in df.columns],
                 names=["Ticker", "Field"]
             )
-            
+
             logger.info(f"✅ {ticker} (Stooq): {len(df)} rows")
             return df
-            
+
         except Exception as e:
             if attempt < 2:
                 wait = 5 * (2 ** attempt) + random.randint(1, 5)
@@ -161,7 +161,7 @@ def _fetch_stooq_single(ticker: str, start: str, end: str) -> pd.DataFrame | Non
             else:
                 logger.error(f"❌ Stooq failed for {ticker} after 3 attempts.")
                 return None
-    
+
     return None
 
 
@@ -278,7 +278,7 @@ def last_trading_day() -> str:
 
 
 # ------------------------------------------------------------
-# Derived macro features — FIX: preserve DatetimeIndex
+# Derived macro features
 # ------------------------------------------------------------
 
 def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
@@ -337,10 +337,10 @@ def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
         yc_z = -zscore(macro["T10Y2Y"])
         d["macro_stress_composite"] = (vix_z + hy_z + yc_z) / 3.0
 
-    # FIX: drop rows where ALL values are NaN only — never reset the index
+    # Drop rows where ALL values are NaN — preserve the DatetimeIndex
     d = d.dropna(how="all")
 
-    # FIX: ensure index is a proper named DatetimeIndex
+    # Ensure proper named DatetimeIndex
     d.index = pd.to_datetime(d.index)
     d.index.name = "Date"
 
@@ -406,7 +406,7 @@ def build_master(
 
 def _df_to_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
-    # FIX: ensure index always has a name so it survives parquet round-trip
+    # Ensure index always has a name so it survives parquet round-trip
     if df.index.name is None:
         df = df.copy()
         df.index.name = "Date"
@@ -449,12 +449,43 @@ def load_parquet(hf_path: str) -> pd.DataFrame:
         force_download=True,
     )
     df = pd.read_parquet(local)
-    # Handle date stored as column or index
-    if "Date" in df.columns:
-        df = df.set_index("Date")
-    elif "date" in df.columns:
-        df = df.set_index("date")
+
+    # FIX: real dates may be stored in a column called 'index'
+    # caused by double reset_index() on save — recover them first
+    if "index" in df.columns:
+        candidate = pd.to_datetime(df["index"], errors="coerce")
+        if candidate.notna().any() and candidate.dropna().dt.year.min() >= 1990:
+            df = df.drop(columns=[df.index.name] if df.index.name else [])
+            df["index"] = candidate
+            df = df.dropna(subset=["index"])
+            df = df.set_index("index")
+            df.index.name = "Date"
+            df.index = pd.to_datetime(df.index)
+            df = df.sort_index()
+            df = df[~df.index.duplicated(keep="last")]
+            logger.info(f"load_parquet({hf_path}): recovered dates from 'index' column, "
+                       f"range={df.index[0].date()} → {df.index[-1].date()}")
+            return df
+
+    # Handle date stored as a named column
+    for col in ["Date", "date", "datetime"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+            df = df.dropna(subset=[col])
+            df = df.set_index(col)
+            break
+
+    # Reject fake epoch index (integer index misread as nanosecond timestamps)
+    if isinstance(df.index, pd.DatetimeIndex) and len(df) > 0 and df.index[0].year < 1990:
+        raise ValueError(
+            f"load_parquet({hf_path}): index looks like epoch integers, not real dates. "
+            f"Sample: {df.index[:3].tolist()}. "
+            f"The file was likely saved with a plain integer index. "
+            f"Run the fix_macro_derived workflow to repair it."
+        )
+
     df.index = pd.to_datetime(df.index)
     df.index.name = "Date"
     df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
     return df
