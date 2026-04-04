@@ -21,56 +21,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fix and re-upload macro_fred and macro_derived
+      - name: Fix and re-upload macro_derived.parquet
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
           python - <<EOF
-          from huggingface_hub import hf_hub_download, HfApi
-          import pandas as pd
-          import io
-          import config as cfg
           import data_utils as du
+          import config as cfg
 
-          def load_raw(hf_path):
-              local = hf_hub_download(
-                  repo_id=cfg.HF_DATASET_REPO,
-                  filename=hf_path,
-                  repo_type="dataset",
-                  token=cfg.HF_TOKEN,
-                  force_download=True,
-              )
-              return pd.read_parquet(local)
+          # load_parquet now handles date recovery automatically
+          macro = du.load_parquet(cfg.FILE_MACRO_FRED)
+          print(f"macro_fred: shape={macro.shape}, range={macro.index[0].date()} → {macro.index[-1].date()}")
+          print(f"Columns: {list(macro.columns)}")
 
-          # ── FIX macro_fred ──────────────────────────────────────
-          print("=== Fixing macro_fred.parquet ===")
-          raw = load_raw(cfg.FILE_MACRO_FRED)
-          print(f"Before: shape={raw.shape}, index sample={raw.index[:3].tolist()}")
-          print(f"Columns: {list(raw.columns)}")
+          # Recompute derived with correct dates
+          macro_derived = du.compute_macro_derived(macro)
+          print(f"macro_derived: shape={macro_derived.shape}, range={macro_derived.index[0].date()} → {macro_derived.index[-1].date()}")
 
-          # The real dates are in the 'index' column
-          raw["index"] = pd.to_datetime(raw["index"], errors="coerce")
-          raw = raw.dropna(subset=["index"])
-          raw = raw.set_index("index")
-          raw.index.name = "Date"
-          raw = raw.sort_index()
-          raw = raw[~raw.index.duplicated(keep="last")]
-
-          print(f"After: shape={raw.shape}, range={raw.index[0].date()} → {raw.index[-1].date()}")
-
-          # Re-upload fixed macro_fred
-          du.upload_parquet(raw, cfg.FILE_MACRO_FRED, "Fix: restore DatetimeIndex on macro_fred")
+          # Re-upload both with correct DatetimeIndex
+          du.upload_parquet(macro, cfg.FILE_MACRO_FRED, "Fix: clean DatetimeIndex on macro_fred")
           print("macro_fred.parquet re-uploaded.")
 
-          # ── RECOMPUTE macro_derived ─────────────────────────────
-          print("\n=== Recomputing macro_derived.parquet ===")
-          macro_derived = du.compute_macro_derived(raw)
-          print(f"Derived: shape={macro_derived.shape}, range={macro_derived.index[0].date()} → {macro_derived.index[-1].date()}")
-
-          # Re-upload fixed macro_derived
           du.upload_parquet(macro_derived, cfg.FILE_MACRO_DERIVED, "Fix: restore DatetimeIndex on macro_derived")
           print("macro_derived.parquet re-uploaded.")
 
-          print("\nAll done. Both parquets fixed.")
+          print("\nAll done.")
           EOF
