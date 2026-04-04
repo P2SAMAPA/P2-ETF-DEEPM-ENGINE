@@ -21,52 +21,56 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Diagnose macro_fred.parquet
+      - name: Fix and re-upload macro_fred and macro_derived
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
           python - <<EOF
-          from huggingface_hub import hf_hub_download
+          from huggingface_hub import hf_hub_download, HfApi
           import pandas as pd
+          import io
           import config as cfg
+          import data_utils as du
 
-          # Read raw parquet WITHOUT any processing
-          local = hf_hub_download(
-              repo_id=cfg.HF_DATASET_REPO,
-              filename=cfg.FILE_MACRO_FRED,
-              repo_type="dataset",
-              token=cfg.HF_TOKEN,
-              force_download=True,
-          )
-          raw = pd.read_parquet(local)
+          def load_raw(hf_path):
+              local = hf_hub_download(
+                  repo_id=cfg.HF_DATASET_REPO,
+                  filename=hf_path,
+                  repo_type="dataset",
+                  token=cfg.HF_TOKEN,
+                  force_download=True,
+              )
+              return pd.read_parquet(local)
 
-          print("=== RAW macro_fred.parquet ===")
-          print(f"Shape: {raw.shape}")
+          # ── FIX macro_fred ──────────────────────────────────────
+          print("=== Fixing macro_fred.parquet ===")
+          raw = load_raw(cfg.FILE_MACRO_FRED)
+          print(f"Before: shape={raw.shape}, index sample={raw.index[:3].tolist()}")
           print(f"Columns: {list(raw.columns)}")
-          print(f"Index type: {type(raw.index)}")
-          print(f"Index name: {raw.index.name}")
-          print(f"Index dtype: {raw.index.dtype}")
-          print(f"Index sample: {raw.index[:5].tolist()}")
-          print(f"Head:\n{raw.head(3)}")
-          print(f"Tail:\n{raw.tail(3)}")
 
-          # Also check etf_returns for comparison
-          local2 = hf_hub_download(
-              repo_id=cfg.HF_DATASET_REPO,
-              filename=cfg.FILE_ETF_RETURNS,
-              repo_type="dataset",
-              token=cfg.HF_TOKEN,
-              force_download=True,
-          )
-          raw2 = pd.read_parquet(local2)
+          # The real dates are in the 'index' column
+          raw["index"] = pd.to_datetime(raw["index"], errors="coerce")
+          raw = raw.dropna(subset=["index"])
+          raw = raw.set_index("index")
+          raw.index.name = "Date"
+          raw = raw.sort_index()
+          raw = raw[~raw.index.duplicated(keep="last")]
 
-          print("\n=== RAW etf_returns.parquet ===")
-          print(f"Shape: {raw2.shape}")
-          print(f"Columns: {list(raw2.columns)}")
-          print(f"Index type: {type(raw2.index)}")
-          print(f"Index name: {raw2.index.name}")
-          print(f"Index dtype: {raw2.index.dtype}")
-          print(f"Index sample: {raw2.index[:5].tolist()}")
-          print(f"Head:\n{raw2.head(3)}")
+          print(f"After: shape={raw.shape}, range={raw.index[0].date()} → {raw.index[-1].date()}")
+
+          # Re-upload fixed macro_fred
+          du.upload_parquet(raw, cfg.FILE_MACRO_FRED, "Fix: restore DatetimeIndex on macro_fred")
+          print("macro_fred.parquet re-uploaded.")
+
+          # ── RECOMPUTE macro_derived ─────────────────────────────
+          print("\n=== Recomputing macro_derived.parquet ===")
+          macro_derived = du.compute_macro_derived(raw)
+          print(f"Derived: shape={macro_derived.shape}, range={macro_derived.index[0].date()} → {macro_derived.index[-1].date()}")
+
+          # Re-upload fixed macro_derived
+          du.upload_parquet(macro_derived, cfg.FILE_MACRO_DERIVED, "Fix: restore DatetimeIndex on macro_derived")
+          print("macro_derived.parquet re-uploaded.")
+
+          print("\nAll done. Both parquets fixed.")
           EOF
