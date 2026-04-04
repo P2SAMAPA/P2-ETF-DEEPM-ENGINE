@@ -1,7 +1,7 @@
 name: Fix macro_derived index
 
 on:
-  workflow_dispatch:  # manual trigger only
+  workflow_dispatch:
 
 jobs:
   fix:
@@ -21,21 +21,52 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fix and re-upload macro_derived.parquet
+      - name: Diagnose macro_fred.parquet
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
           python - <<EOF
-          import data_utils as du
+          from huggingface_hub import hf_hub_download
+          import pandas as pd
           import config as cfg
 
-          macro = du.load_parquet(cfg.FILE_MACRO_FRED)
-          print(f"Raw macro: {macro.shape}, range: {macro.index[0].date()} → {macro.index[-1].date()}")
+          # Read raw parquet WITHOUT any processing
+          local = hf_hub_download(
+              repo_id=cfg.HF_DATASET_REPO,
+              filename=cfg.FILE_MACRO_FRED,
+              repo_type="dataset",
+              token=cfg.HF_TOKEN,
+              force_download=True,
+          )
+          raw = pd.read_parquet(local)
 
-          macro_derived = du.compute_macro_derived(macro)
-          print(f"Derived: {macro_derived.shape}, range: {macro_derived.index[0].date()} → {macro_derived.index[-1].date()}")
+          print("=== RAW macro_fred.parquet ===")
+          print(f"Shape: {raw.shape}")
+          print(f"Columns: {list(raw.columns)}")
+          print(f"Index type: {type(raw.index)}")
+          print(f"Index name: {raw.index.name}")
+          print(f"Index dtype: {raw.index.dtype}")
+          print(f"Index sample: {raw.index[:5].tolist()}")
+          print(f"Head:\n{raw.head(3)}")
+          print(f"Tail:\n{raw.tail(3)}")
 
-          du.upload_parquet(macro_derived, cfg.FILE_MACRO_DERIVED, "Fix: restore DatetimeIndex on macro_derived")
-          print("Done.")
+          # Also check etf_returns for comparison
+          local2 = hf_hub_download(
+              repo_id=cfg.HF_DATASET_REPO,
+              filename=cfg.FILE_ETF_RETURNS,
+              repo_type="dataset",
+              token=cfg.HF_TOKEN,
+              force_download=True,
+          )
+          raw2 = pd.read_parquet(local2)
+
+          print("\n=== RAW etf_returns.parquet ===")
+          print(f"Shape: {raw2.shape}")
+          print(f"Columns: {list(raw2.columns)}")
+          print(f"Index type: {type(raw2.index)}")
+          print(f"Index name: {raw2.index.name}")
+          print(f"Index dtype: {raw2.index.dtype}")
+          print(f"Index sample: {raw2.index[:5].tolist()}")
+          print(f"Head:\n{raw2.head(3)}")
           EOF
