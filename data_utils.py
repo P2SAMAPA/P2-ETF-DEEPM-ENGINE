@@ -42,10 +42,8 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     for i, ticker in enumerate(yf_tickers):
         logger.info(f"[{i+1}/{len(yf_tickers)}] Fetching {ticker}...")
         
-        # Try Yahoo Finance first
         df = _fetch_yf_single(ticker, start, end)
         
-        # Fallback to Stooq if YF fails
         if df is None:
             logger.warning(f"🔄 YF failed for {ticker}, trying Stooq fallback...")
             df = _fetch_stooq_single(ticker, start, end)
@@ -56,7 +54,6 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
             failed.append(ticker)
             logger.error(f"❌ All sources failed for {ticker}")
         
-        # Polite delay between tickers (critical for avoiding rate limits)
         if i < len(yf_tickers) - 1:
             delay = random.uniform(1.0, 2.5)
             time.sleep(delay)
@@ -67,7 +64,6 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     if failed:
         logger.warning(f"⚠️ Failed tickers: {failed} — continuing with {len(frames)} tickers.")
     
-    # Combine all tickers into MultiIndex DataFrame
     combined = pd.concat(frames, axis=1)
     combined = combined.sort_index()
     combined = combined[~combined.index.duplicated(keep="last")]
@@ -76,11 +72,11 @@ def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     logger.info(f"OHLCV download complete. Shape: {combined.shape}")
     return combined
 
+
 def _fetch_yf_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
     """Fetch single ticker from Yahoo Finance with exponential backoff."""
-    for attempt in range(6):  # 0-5 attempts
+    for attempt in range(6):
         try:
-            # CRITICAL: threads=False prevents SQLite DB locks
             raw = yf.download(
                 ticker,
                 start=start,
@@ -93,11 +89,9 @@ def _fetch_yf_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
             if raw is None or raw.empty:
                 raise ValueError(f"Empty response for {ticker}")
             
-            # Flatten MultiIndex columns if present (yfinance sometimes returns MultiIndex)
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = [col[0] for col in raw.columns]
             
-            # Keep only OHLCV fields
             available = [f for f in OHLCV_FIELDS if f in raw.columns]
             if not available:
                 raise ValueError(f"No OHLCV columns found for {ticker}")
@@ -105,7 +99,6 @@ def _fetch_yf_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
             df = raw[available].copy()
             df.index = pd.to_datetime(df.index).tz_localize(None)
             
-            # Create MultiIndex columns: (ticker, field)
             df.columns = pd.MultiIndex.from_tuples(
                 [(ticker, f) for f in df.columns],
                 names=["Ticker", "Field"]
@@ -119,7 +112,6 @@ def _fetch_yf_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
             is_rate_limit = any(k in err_str for k in ["rate limit", "too many", "429", "ratelimit"])
             
             if is_rate_limit and attempt < 5:
-                # Exponential backoff: 30s, 60s, 120s, 240s, 480s + jitter
                 wait = 30 * (2 ** attempt) + random.randint(5, 15)
                 logger.warning(f"⚠️ YF rate limited on {ticker} (attempt {attempt+1}). Waiting {wait}s...")
                 time.sleep(wait)
@@ -128,6 +120,7 @@ def _fetch_yf_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
                 return None
     
     return None
+
 
 def _fetch_stooq_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
     """Fetch single ticker from Stooq as fallback (no API key required)."""
@@ -142,20 +135,16 @@ def _fetch_stooq_single(ticker: str, start: str, end: str) -> pd.DataFrame | Non
                 raise ValueError(f"Empty Stooq response for {ticker}")
             
             raw = raw.sort_index()
-            
-            # Filter date range
             mask = (raw.index >= start) & (raw.index <= end)
             raw = raw.loc[mask]
             
             if raw.empty:
                 raise ValueError(f"No data in range for {ticker} from Stooq")
             
-            # Stooq returns: Open, High, Low, Close, Volume
             available = [f for f in OHLCV_FIELDS if f in raw.columns]
             df = raw[available].copy()
             df.index = pd.to_datetime(df.index).tz_localize(None)
             
-            # Create MultiIndex columns
             df.columns = pd.MultiIndex.from_tuples(
                 [(ticker, f) for f in df.columns],
                 names=["Ticker", "Field"]
@@ -175,19 +164,18 @@ def _fetch_stooq_single(ticker: str, start: str, end: str) -> pd.DataFrame | Non
     
     return None
 
+
 # ------------------------------------------------------------
-# flatten_ohlcv — Updated to handle HURST-style MultiIndex
+# flatten_ohlcv
 # ------------------------------------------------------------
 
 def flatten_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """
     Flatten MultiIndex OHLCV DataFrame to single-level columns like TLT_Close.
-    Handles both (Ticker, Field) MultiIndex and already-flat formats.
     """
     df = df.copy()
 
     if isinstance(df.columns, pd.MultiIndex):
-        # Handle (Ticker, Field) format
         lvl0 = df.columns.get_level_values(0).tolist()
         lvl1 = df.columns.get_level_values(1).tolist()
 
@@ -202,17 +190,12 @@ def flatten_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
         df = df.iloc[:, keep]
         df.columns = new_cols
-    else:
-        # Handle flat columns - check if already formatted as Ticker_Field
-        cols = df.columns.tolist()
-        # If columns look like "TLT_Close", we're good
-        # If columns are just field names, we need to infer ticker (shouldn't happen)
-        pass
 
     return df
 
+
 # ------------------------------------------------------------
-# Returns computation — Unchanged
+# Returns computation
 # ------------------------------------------------------------
 
 def compute_returns(ohlcv_flat: pd.DataFrame, tickers: list) -> pd.DataFrame:
@@ -233,8 +216,9 @@ def compute_returns(ohlcv_flat: pd.DataFrame, tickers: list) -> pd.DataFrame:
     logger.info(f"Returns shape: {rets.shape}")
     return rets
 
+
 # ------------------------------------------------------------
-# FRED download — Unchanged
+# FRED download
 # ------------------------------------------------------------
 
 def download_fred(start: str, end: str = None) -> pd.DataFrame:
@@ -264,8 +248,9 @@ def download_fred(start: str, end: str = None) -> pd.DataFrame:
     logger.info(f"Macro FRED shape: {df.shape}, range: {df.index[0].date()} -> {df.index[-1].date()}")
     return df
 
+
 # ------------------------------------------------------------
-# Calendar helpers — Unchanged
+# Calendar helpers
 # ------------------------------------------------------------
 
 def get_trading_days(start: str, end: str = None) -> pd.DatetimeIndex:
@@ -274,6 +259,7 @@ def get_trading_days(start: str, end: str = None) -> pd.DatetimeIndex:
     end = end or date.today().strftime("%Y-%m-%d")
     schedule = nyse.schedule(start_date=start, end_date=end)
     return mcal.date_range(schedule, frequency="1D").normalize().tz_localize(None)
+
 
 def last_trading_day() -> str:
     """Return the most recent completed NYSE trading day."""
@@ -290,8 +276,9 @@ def last_trading_day() -> str:
         latest = days[-2] if len(days) > 1 else days[-1]
     return latest.strftime("%Y-%m-%d")
 
+
 # ------------------------------------------------------------
-# Derived macro features — Unchanged
+# Derived macro features — FIX: preserve DatetimeIndex
 # ------------------------------------------------------------
 
 def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
@@ -350,12 +337,20 @@ def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
         yc_z = -zscore(macro["T10Y2Y"])
         d["macro_stress_composite"] = (vix_z + hy_z + yc_z) / 3.0
 
+    # FIX: drop rows where ALL values are NaN only — never reset the index
     d = d.dropna(how="all")
+
+    # FIX: ensure index is a proper named DatetimeIndex
+    d.index = pd.to_datetime(d.index)
+    d.index.name = "Date"
+
     logger.info(f"Derived macro shape: {d.shape}, cols: {list(d.columns)}")
+    logger.info(f"Derived macro date range: {d.index[0].date()} → {d.index[-1].date()}")
     return d
 
+
 # ------------------------------------------------------------
-# build_master — Unchanged
+# build_master
 # ------------------------------------------------------------
 
 def build_master(
@@ -404,14 +399,20 @@ def build_master(
     )
     return master
 
+
 # ------------------------------------------------------------
-# HuggingFace I/O — Unchanged
+# HuggingFace I/O — FIX: ensure index name preserved on save
 # ------------------------------------------------------------
 
 def _df_to_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
+    # FIX: ensure index always has a name so it survives parquet round-trip
+    if df.index.name is None:
+        df = df.copy()
+        df.index.name = "Date"
     df.to_parquet(buf, index=True, engine="pyarrow")
     return buf.getvalue()
+
 
 def upload_parquet(df: pd.DataFrame, hf_path: str, commit_msg: str) -> None:
     api = HfApi(token=cfg.HF_TOKEN)
@@ -425,6 +426,7 @@ def upload_parquet(df: pd.DataFrame, hf_path: str, commit_msg: str) -> None:
     )
     logger.info(f"Uploaded {hf_path} to {cfg.HF_DATASET_REPO}")
 
+
 def upload_json(obj: dict, hf_path: str, commit_msg: str) -> None:
     api = HfApi(token=cfg.HF_TOKEN)
     data = json.dumps(obj, indent=2, default=str).encode("utf-8")
@@ -437,6 +439,7 @@ def upload_json(obj: dict, hf_path: str, commit_msg: str) -> None:
     )
     logger.info(f"Uploaded {hf_path} to {cfg.HF_DATASET_REPO}")
 
+
 def load_parquet(hf_path: str) -> pd.DataFrame:
     local = hf_hub_download(
         repo_id=cfg.HF_DATASET_REPO,
@@ -446,22 +449,12 @@ def load_parquet(hf_path: str) -> pd.DataFrame:
         force_download=True,
     )
     df = pd.read_parquet(local)
+    # Handle date stored as column or index
     if "Date" in df.columns:
         df = df.set_index("Date")
+    elif "date" in df.columns:
+        df = df.set_index("date")
     df.index = pd.to_datetime(df.index)
+    df.index.name = "Date"
     df = df.sort_index()
     return df
-
-def load_metadata() -> dict:
-    try:
-        local = hf_hub_download(
-            repo_id=cfg.HF_DATASET_REPO,
-            filename=cfg.FILE_METADATA,
-            repo_type="dataset",
-            token=cfg.HF_TOKEN,
-            force_download=True,
-        )
-        with open(local) as f:
-            return json.load(f)
-    except Exception:
-        return {}
