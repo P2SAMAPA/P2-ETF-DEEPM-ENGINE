@@ -47,6 +47,7 @@ EQ_ETFS = [
     "GDX",   # Gold Miners
     "XLB",   # Basic Materials
     "XLRE",  # Real Estate
+    "IWM",   # Russell 2000
     "XME",   # Metals & Mining
 ]
 EQ_BENCHMARK  = "SPY"
