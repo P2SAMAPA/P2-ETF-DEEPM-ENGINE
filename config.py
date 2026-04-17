@@ -49,6 +49,10 @@ EQ_ETFS = [
     "XLRE",  # Real Estate
     "IWM",   # Russell 2000
     "XME",   # Metals & Mining
+    "IWF",
+    "IWM".
+    "XSD",
+    "XBI",
 ]
 EQ_BENCHMARK  = "SPY"
 
