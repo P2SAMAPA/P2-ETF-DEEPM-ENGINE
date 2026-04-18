@@ -1,15 +1,21 @@
+# .github/workflows/seed_dataset.yml
+#
+# Seed the full historical dataset (run once, or on demand).
+# Fixed: upgrades yfinance before running, adds startup delay to reduce
+# Yahoo Finance 429 rate-limit errors from GitHub Actions shared IPs.
+
 name: Seed Dataset (run once)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # manual trigger only
 
 jobs:
   seed:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 60    # seed can take ~20-30 min for 27 tickers
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -19,19 +25,26 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements_train.txt
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          # Always upgrade yfinance to latest — older versions have broken
+          # crumb/cookie auth that causes 429 errors in CI environments
+          pip install --upgrade yfinance requests
 
-      - name: Download full dataset (2008 to today)
+      # Wait before hammering Yahoo Finance — GitHub Actions runners share
+      # IP ranges that are aggressively rate-limited.  A 30s pause after
+      # install lets any prior run's rate-limit window expire.
+      - name: Startup delay (reduce YF rate-limit risk)
+        run: sleep 30
+
+      - name: Seed dataset
         env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          HF_TOKEN:     ${{ secrets.HF_TOKEN }}
         run: python data_download.py --mode seed
 
-      - name: Push data to HuggingFace
+      - name: Upload to HuggingFace
         env:
-          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
-          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
-        run: python data_upload_hf.py --meta
-
-      - name: Confirm upload
-        run: echo "Seed complete. Data uploaded to HuggingFace."
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python data_upload_hf.py
