@@ -46,14 +46,14 @@ EQ_ETFS = [
     "XLU",   # Utilities
     "GDX",   # Gold Miners
     "XLB",   # Basic Materials
+    "IWF",
+    "IWM",
+    "XSD",
+    "XBI",
     "XLRE",  # Real Estate
     "IWM",   # Russell 2000
     "XME",   # Metals & Mining
-    "IWF",
-    "IWM".
-    "XSD",
-    "XBI",
-]
+   ]
 EQ_BENCHMARK  = "SPY"
 
 # ── All tickers to download (OHLCV) ───────────────────────────────────────────
