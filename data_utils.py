@@ -1,209 +1,297 @@
-# data_utils.py — Updated with HURST-repo style sequential download + Stooq fallback
+# data_utils.py — Shared data download, transform and HuggingFace I/O
+#
+# FIXES applied (2026-04-18):
+#   1. Stooq fallback now uses direct CSV download instead of pandas_datareader
+#      (pandas_datareader's Stooq reader is broken — missing Date column error)
+#   2. yfinance: use yf.Ticker().history() which handles crumb/cookie auth better
+#      than yf.download() in CI/GitHub Actions environments
+#   3. download_ohlcv: no longer raises if SOME tickers fail — warns and continues
+#      (previously a single ticker failure killed the entire run)
+#   4. Added longer initial backoff and jitter to reduce 429 rate-limit hits
+
 import io
 import json
 import logging
 import os
 import random
 import time
-import re
 from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
+import requests
 import yfinance as yf
 from fredapi import Fred
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, upload_file
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import config as cfg
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-OHLCV_FIELDS = ["Open", "High", "Low", "Close", "Volume"]
+# ─────────────────────────────────────────────────────────────────────────────
+# Persistent requests session (used for Stooq direct CSV downloads)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ------------------------------------------------------------
-# OHLCV download — Sequential single-ticker with exponential backoff
-# ------------------------------------------------------------
+def _get_session() -> requests.Session:
+    session = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=2,          # delays: 2, 4, 8, 16, 32 s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    # Mimic a browser so Stooq/YF don't reject us outright
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+    return session
+
+_SESSION = _get_session()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stooq direct CSV fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_stooq_csv(ticker: str, start: str, end: str) -> pd.DataFrame | None:
+    """
+    Download OHLCV from Stooq as a direct CSV request.
+    Tries bare ticker first, then common suffixes (.US, -US).
+    Returns a DataFrame with columns [Open, High, Low, Close, Volume]
+    indexed by date, or None if all attempts fail.
+    """
+    # Stooq date format: YYYYMMDD
+    d1 = start.replace("-", "")
+    d2 = end.replace("-", "")
+
+    suffixes = ["", ".US", "-US"]
+    for suffix in suffixes:
+        stooq_sym = f"{ticker}{suffix}".lower()
+        url = (
+            f"https://stooq.com/q/d/l/"
+            f"?s={stooq_sym}&d1={d1}&d2={d2}&i=d"
+        )
+        try:
+            resp = _SESSION.get(url, timeout=30)
+            resp.raise_for_status()
+
+            # Stooq returns "No data" as plain text when symbol not found
+            if b"No data" in resp.content[:50] or len(resp.content) < 50:
+                logger.warning(f"  Stooq: no data for {stooq_sym}")
+                continue
+
+            df = pd.read_csv(io.StringIO(resp.text))
+
+            if df.empty:
+                logger.warning(f"  Stooq CSV empty for {stooq_sym}")
+                continue
+
+            # Normalise the date column — Stooq uses 'Date' but let's be safe
+            date_col = next(
+                (c for c in df.columns if c.strip().lower() == "date"), None
+            )
+            if date_col is None:
+                logger.warning(f"  Stooq: no Date column for {stooq_sym}. Cols: {list(df.columns)}")
+                continue
+
+            df.index = pd.to_datetime(df[date_col])
+            df.index.name = "Date"
+            df = df.drop(columns=[date_col])
+            df = df.sort_index()
+
+            # Rename to standard capitalisation
+            rename = {c: c.strip().capitalize() for c in df.columns}
+            df = df.rename(columns=rename)
+            # Volume column might be 'Volume' already — ensure it exists
+            for col in ["Open", "High", "Low", "Close"]:
+                if col not in df.columns:
+                    raise ValueError(f"Missing expected column '{col}'")
+
+            logger.info(f"  ✅ Stooq success for {stooq_sym}: {len(df)} rows")
+            return df
+
+        except Exception as exc:
+            logger.warning(f"  Stooq attempt failed for {stooq_sym}: {exc}")
+            time.sleep(random.uniform(5, 10))
+            continue
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Single-ticker robust fetch  (yfinance → Stooq CSV)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_one_ticker_robust(
+    ticker: str,
+    start: str,
+    end: str,
+    data_type: str = "ohlcv",
+    max_yf_retries: int = 4,
+    base_delay: float = 8.0,
+) -> pd.DataFrame | None:
+    """
+    Try yfinance first (up to max_yf_retries), then fall back to Stooq CSV.
+
+    data_type:
+        'ohlcv' → return DataFrame with columns [Open, High, Low, Close, Volume]
+        'close' → return DataFrame with single column named <ticker>
+    """
+
+    # ── 1. yfinance via Ticker.history() ──────────────────────────────────────
+    #   Using Ticker().history() handles crumb/cookie auth much better than
+    #   yf.download() inside GitHub Actions / cloud runners.
+    for attempt in range(max_yf_retries):
+        try:
+            wait = base_delay * (2 ** attempt) + random.uniform(0, 5)
+            if attempt > 0:
+                logger.info(f"  YF retry {attempt}/{max_yf_retries} for {ticker} — waiting {wait:.1f}s")
+                time.sleep(wait)
+            else:
+                time.sleep(random.uniform(2, 5))   # always a small initial delay
+
+            t = yf.Ticker(ticker)
+            df = t.history(
+                start=start,
+                end=end,
+                auto_adjust=True,
+                actions=False,
+            )
+
+            if df is None or df.empty:
+                raise ValueError(f"Empty response from yfinance for {ticker}")
+
+            # Drop timezone so downstream joins work cleanly
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+
+            if data_type == "ohlcv":
+                keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                df = df[keep].copy()
+            else:
+                if "Close" not in df.columns:
+                    raise ValueError("No Close column in yfinance response")
+                df = df[["Close"]].copy()
+                df.columns = [ticker]
+
+            logger.info(f"  ✅ YF success for {ticker}: {len(df)} rows")
+            return df
+
+        except Exception as exc:
+            logger.warning(f"  ❌ YF attempt {attempt+1}/{max_yf_retries} failed for {ticker}: {exc}")
+            if attempt == max_yf_retries - 1:
+                logger.warning(f"  YF exhausted for {ticker} — trying Stooq CSV fallback")
+
+    # ── 2. Stooq CSV fallback ─────────────────────────────────────────────────
+    logger.info(f"  🔄 Stooq CSV fallback for {ticker}...")
+    df = _fetch_stooq_csv(ticker, start, end)
+
+    if df is None:
+        logger.error(f"  ❌ All sources failed for {ticker}")
+        return None
+
+    # Normalise output format to match yfinance output
+    if data_type == "ohlcv":
+        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        df = df[keep].copy()
+    else:
+        if "Close" not in df.columns:
+            logger.error(f"  Stooq result for {ticker} has no Close column")
+            return None
+        df = df[["Close"]].copy()
+        df.columns = [ticker]
+
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch OHLCV download
+# ─────────────────────────────────────────────────────────────────────────────
 
 def download_ohlcv(tickers: list, start: str, end: str = None) -> pd.DataFrame:
     """
-    Download OHLCV using HURST-style sequential approach with exponential backoff.
-    This avoids YF rate limits better than batch downloads from cloud IPs.
+    Download OHLCV for all tickers one-by-one (batch yf.download is too
+    aggressive on rate limits from CI runners).
+
+    Returns a DataFrame with MultiIndex columns (Ticker, Field).
+
+    CHANGED: no longer raises if some tickers fail — logs a warning and
+    continues with the tickers that succeeded.  Only raises if ALL fail.
     """
     end = end or date.today().strftime("%Y-%m-%d")
-    yf_tickers = [t for t in tickers if t != "CASH"]
+    logger.info(f"Downloading OHLCV (sequential): {len(tickers)} tickers {start}→{end}")
 
-    logger.info(f"Downloading OHLCV (sequential): {len(yf_tickers)} tickers {start}→{end}")
+    frames: list[pd.DataFrame] = []
+    failed: list[str] = []
 
-    frames = []
-    failed = []
+    for i, ticker in enumerate(tickers):
+        logger.info(f"[{i+1}/{len(tickers)}] Fetching {ticker}...")
 
-    for i, ticker in enumerate(yf_tickers):
-        logger.info(f"[{i+1}/{len(yf_tickers)}] Fetching {ticker}...")
+        # Progressive pacing: small base delay + extra pause every 5 tickers
+        base_wait = random.uniform(2, 4)
+        if i > 0 and i % 5 == 0:
+            extra = random.uniform(8, 12)
+            logger.info(f"  ⏳ Pacing delay ({extra:.1f}s) after every 5 tickers...")
+            time.sleep(extra)
+        else:
+            time.sleep(base_wait)
 
-        df = _fetch_yf_single(ticker, start, end)
+        df = _fetch_one_ticker_robust(ticker, start, end, data_type="ohlcv")
 
-        if df is None:
-            logger.warning(f"🔄 YF failed for {ticker}, trying Stooq fallback...")
-            df = _fetch_stooq_single(ticker, start, end)
-
-        if df is not None:
+        if df is not None and not df.empty:
+            df.columns = pd.MultiIndex.from_tuples(
+                [(ticker, col) for col in df.columns],
+                names=["Ticker", "Field"],
+            )
             frames.append(df)
         else:
+            logger.warning(f"  ⚠️ Skipping {ticker} — no data from any source")
             failed.append(ticker)
-            logger.error(f"❌ All sources failed for {ticker}")
-
-        if i < len(yf_tickers) - 1:
-            delay = random.uniform(1.0, 2.5)
-            time.sleep(delay)
 
     if not frames:
         raise ValueError("No data fetched from any source for any ticker.")
 
     if failed:
-        logger.warning(f"⚠️ Failed tickers: {failed} — continuing with {len(frames)} tickers.")
+        logger.warning(
+            f"⚠️  {len(failed)}/{len(tickers)} tickers could not be fetched "
+            f"and will be MISSING from the dataset: {failed}"
+        )
 
     combined = pd.concat(frames, axis=1)
-    combined = combined.sort_index()
-    combined = combined[~combined.index.duplicated(keep="last")]
-    combined = combined.ffill()
-
-    logger.info(f"OHLCV download complete. Shape: {combined.shape}")
+    combined.index = pd.to_datetime(combined.index).tz_localize(None)
+    combined.sort_index(inplace=True)
+    logger.info(f"OHLCV download complete. Shape: {combined.shape}. Failed: {failed or 'none'}")
     return combined
 
 
-def _fetch_yf_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
-    """Fetch single ticker from Yahoo Finance with exponential backoff."""
-    for attempt in range(6):
-        try:
-            raw = yf.download(
-                ticker,
-                start=start,
-                end=end,
-                progress=False,
-                auto_adjust=True,
-                threads=False,
-            )
-
-            if raw is None or raw.empty:
-                raise ValueError(f"Empty response for {ticker}")
-
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = [col[0] for col in raw.columns]
-
-            available = [f for f in OHLCV_FIELDS if f in raw.columns]
-            if not available:
-                raise ValueError(f"No OHLCV columns found for {ticker}")
-
-            df = raw[available].copy()
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-
-            df.columns = pd.MultiIndex.from_tuples(
-                [(ticker, f) for f in df.columns],
-                names=["Ticker", "Field"]
-            )
-
-            logger.info(f"✅ {ticker} (YF): {len(df)} rows")
-            return df
-
-        except Exception as e:
-            err_str = str(e).lower()
-            is_rate_limit = any(k in err_str for k in ["rate limit", "too many", "429", "ratelimit"])
-
-            if is_rate_limit and attempt < 5:
-                wait = 30 * (2 ** attempt) + random.randint(5, 15)
-                logger.warning(f"⚠️ YF rate limited on {ticker} (attempt {attempt+1}). Waiting {wait}s...")
-                time.sleep(wait)
-            else:
-                logger.warning(f"❌ YF failed for {ticker} after {attempt+1} attempts: {e}")
-                return None
-
-    return None
-
-
-def _fetch_stooq_single(ticker: str, start: str, end: str) -> pd.DataFrame | None:
-    """Fetch single ticker from Stooq as fallback (no API key required)."""
-    stooq_symbol = ticker.lower() + ".us"
-    url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
-
-    for attempt in range(3):
-        try:
-            raw = pd.read_csv(url, parse_dates=["Date"], index_col="Date")
-
-            if raw.empty:
-                raise ValueError(f"Empty Stooq response for {ticker}")
-
-            raw = raw.sort_index()
-            mask = (raw.index >= start) & (raw.index <= end)
-            raw = raw.loc[mask]
-
-            if raw.empty:
-                raise ValueError(f"No data in range for {ticker} from Stooq")
-
-            available = [f for f in OHLCV_FIELDS if f in raw.columns]
-            df = raw[available].copy()
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-
-            df.columns = pd.MultiIndex.from_tuples(
-                [(ticker, f) for f in df.columns],
-                names=["Ticker", "Field"]
-            )
-
-            logger.info(f"✅ {ticker} (Stooq): {len(df)} rows")
-            return df
-
-        except Exception as e:
-            if attempt < 2:
-                wait = 5 * (2 ** attempt) + random.randint(1, 5)
-                logger.warning(f"⚠️ Stooq attempt {attempt+1} failed for {ticker}: {e}. Retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                logger.error(f"❌ Stooq failed for {ticker} after 3 attempts.")
-                return None
-
-    return None
-
-
-# ------------------------------------------------------------
-# flatten_ohlcv
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Flatten / returns / volatility
+# ─────────────────────────────────────────────────────────────────────────────
 
 def flatten_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Flatten MultiIndex OHLCV DataFrame to single-level columns like TLT_Close.
-    """
+    """Flatten MultiIndex OHLCV DataFrame to single-level columns."""
     df = df.copy()
-
-    if isinstance(df.columns, pd.MultiIndex):
-        lvl0 = df.columns.get_level_values(0).tolist()
-        lvl1 = df.columns.get_level_values(1).tolist()
-
-        new_cols = []
-        keep = []
-        for i, (t, f) in enumerate(zip(lvl0, lvl1)):
-            t = str(t).strip()
-            f = str(f).strip()
-            if t and f and t.lower() != "nan" and f.lower() != "nan":
-                new_cols.append(f"{t}_{f}")
-                keep.append(i)
-
-        df = df.iloc[:, keep]
-        df.columns = new_cols
-
+    df.columns = [f"{ticker}_{field}" for ticker, field in df.columns]
     return df
 
-
-# ------------------------------------------------------------
-# Returns computation
-# ------------------------------------------------------------
 
 def compute_returns(ohlcv_flat: pd.DataFrame, tickers: list) -> pd.DataFrame:
     """Compute simple and log daily returns from flat OHLCV DataFrame."""
     rets = pd.DataFrame(index=ohlcv_flat.index)
     for ticker in tickers:
-        if ticker == "CASH":
-            continue
         close_col = f"{ticker}_Close"
         if close_col not in ohlcv_flat.columns:
             logger.warning(f"Missing Close for {ticker}, skipping returns")
@@ -211,18 +299,17 @@ def compute_returns(ohlcv_flat: pd.DataFrame, tickers: list) -> pd.DataFrame:
         close = ohlcv_flat[close_col]
         rets[f"{ticker}_ret"] = close.pct_change()
         rets[f"{ticker}_logret"] = np.log(close / close.shift(1))
-
     rets = rets.dropna(how="all")
     logger.info(f"Returns shape: {rets.shape}")
     return rets
 
 
-# ------------------------------------------------------------
-# FRED download
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# FRED macro
+# ─────────────────────────────────────────────────────────────────────────────
 
 def download_fred(start: str, end: str = None) -> pd.DataFrame:
-    """Download all FRED macro series."""
+    """Download all FRED macro series defined in config.FRED_SERIES."""
     end = end or date.today().strftime("%Y-%m-%d")
     fred = Fred(api_key=cfg.FRED_API_KEY)
     frames = {}
@@ -232,8 +319,8 @@ def download_fred(start: str, end: str = None) -> pd.DataFrame:
             s.name = name
             frames[name] = s
             logger.info(f"FRED {series_id} ({name}): {len(s)} observations")
-        except Exception as e:
-            logger.error(f"Failed to fetch FRED {series_id}: {e}")
+        except Exception as exc:
+            logger.error(f"Failed to fetch FRED {series_id}: {exc}")
 
     if not frames:
         raise ValueError("No FRED series downloaded successfully")
@@ -241,17 +328,16 @@ def download_fred(start: str, end: str = None) -> pd.DataFrame:
     df = pd.DataFrame(frames)
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df = df.sort_index()
+
     trading_days = get_trading_days(start, end)
-    df = df.reindex(trading_days)
-    df = df.ffill()
-    df = df.dropna(how="all")
-    logger.info(f"Macro FRED shape: {df.shape}, range: {df.index[0].date()} -> {df.index[-1].date()}")
+    df = df.reindex(trading_days).ffill().dropna(how="all")
+    logger.info(f"Macro FRED shape: {df.shape}, range: {df.index[0].date()} → {df.index[-1].date()}")
     return df
 
 
-# ------------------------------------------------------------
-# Calendar helpers
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Trading calendar helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_trading_days(start: str, end: str = None) -> pd.DatetimeIndex:
     """Return NYSE trading days between start and end (inclusive)."""
@@ -262,11 +348,11 @@ def get_trading_days(start: str, end: str = None) -> pd.DatetimeIndex:
 
 
 def last_trading_day() -> str:
-    """Return the most recent completed NYSE trading day."""
+    """Return the most recent completed NYSE trading day as YYYY-MM-DD."""
     today = date.today()
     nyse = mcal.get_calendar("NYSE")
-    end = today.strftime("%Y-%m-%d")
     start = (today - timedelta(days=10)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
     schedule = nyse.schedule(start_date=start, end_date=end)
     days = mcal.date_range(schedule, frequency="1D").normalize().tz_localize(None)
     if len(days) == 0:
@@ -277,9 +363,9 @@ def last_trading_day() -> str:
     return latest.strftime("%Y-%m-%d")
 
 
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Derived macro features
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
     """Compute engineered macro features from raw FRED series."""
@@ -315,9 +401,7 @@ def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
     if "HY_SPREAD" in macro.columns and "IG_SPREAD" in macro.columns:
         d["HY_IG_ratio"] = macro["HY_SPREAD"] / (macro["IG_SPREAD"] + 1e-8)
         d["HY_IG_ratio_zscore"] = zscore(d["HY_IG_ratio"])
-        d["credit_stress"] = (
-            zscore(macro["HY_SPREAD"]) + zscore(macro["IG_SPREAD"])
-        ) / 2.0
+        d["credit_stress"] = (zscore(macro["HY_SPREAD"]) + zscore(macro["IG_SPREAD"])) / 2.0
 
     if "USD_INDEX" in macro.columns:
         d["USD_zscore"] = zscore(macro["USD_INDEX"])
@@ -337,21 +421,14 @@ def compute_macro_derived(macro: pd.DataFrame) -> pd.DataFrame:
         yc_z = -zscore(macro["T10Y2Y"])
         d["macro_stress_composite"] = (vix_z + hy_z + yc_z) / 3.0
 
-    # Drop rows where ALL values are NaN — preserve the DatetimeIndex
     d = d.dropna(how="all")
-
-    # Ensure proper named DatetimeIndex
-    d.index = pd.to_datetime(d.index)
-    d.index.name = "Date"
-
     logger.info(f"Derived macro shape: {d.shape}, cols: {list(d.columns)}")
-    logger.info(f"Derived macro date range: {d.index[0].date()} → {d.index[-1].date()}")
     return d
 
 
-# ------------------------------------------------------------
-# build_master
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Master dataset builder
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_master(
     ohlcv_flat: pd.DataFrame,
@@ -359,33 +436,43 @@ def build_master(
     macro: pd.DataFrame,
     macro_derived: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Align all DataFrames on the OHLCV trading-day index (authoritative spine).
-    """
+    """Inner-join all DataFrames on common trading days."""
     logger.info(
         f"build_master inputs: ohlcv={ohlcv_flat.shape}, returns={returns.shape}, "
         f"macro={macro.shape}, macro_derived={macro_derived.shape}"
     )
 
-    if ohlcv_flat.empty:
-        raise ValueError("OHLCV DataFrame is empty — cannot build master")
-
-    spine = ohlcv_flat.index.sort_values()
-
+    # Guard: empty returns
     if returns.empty:
-        logger.warning("Returns DataFrame is empty — filling with zeros")
-        returns = pd.DataFrame(index=spine)
+        logger.warning("Returns DataFrame is empty — filling with zeros.")
+        returns = pd.DataFrame(index=ohlcv_flat.index)
         for col in [c for c in ohlcv_flat.columns if "_Close" in c]:
             ticker = col.replace("_Close", "")
             returns[f"{ticker}_ret"] = 0.0
             returns[f"{ticker}_logret"] = 0.0
 
-    returns_aligned = returns.reindex(spine).ffill(limit=1)
-    macro_aligned = macro.reindex(spine).ffill(limit=5)
-    macro_derived_aligned = macro_derived.reindex(spine).ffill(limit=5)
+    common = (
+        ohlcv_flat.index
+        .intersection(returns.index)
+        .intersection(macro.index)
+        .intersection(macro_derived.index)
+    ).sort_values()
+
+    if len(common) == 0:
+        logger.error("No common dates found between datasets!")
+        logger.error(f"  ohlcv:        {ohlcv_flat.index.min()} → {ohlcv_flat.index.max()}")
+        logger.error(f"  returns:      {returns.index.min()} → {returns.index.max()}")
+        logger.error(f"  macro:        {macro.index.min()} → {macro.index.max()}")
+        logger.error(f"  macro_derived:{macro_derived.index.min()} → {macro_derived.index.max()}")
+        raise ValueError("Cannot build master dataset: no overlapping dates")
 
     master = pd.concat(
-        [ohlcv_flat.reindex(spine), returns_aligned, macro_aligned, macro_derived_aligned],
+        [
+            ohlcv_flat.reindex(common),
+            returns.reindex(common),
+            macro.reindex(common),
+            macro_derived.reindex(common),
+        ],
         axis=1,
     )
     master.index.name = "Date"
@@ -395,30 +482,25 @@ def build_master(
 
     logger.info(
         f"Master shape: {master.shape}, "
-        f"range: {master.index[0].date()} -> {master.index[-1].date()}"
+        f"range: {master.index[0].date()} → {master.index[-1].date()}"
     )
     return master
 
 
-# ------------------------------------------------------------
-# HuggingFace I/O — FIX: ensure index name preserved on save
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# HuggingFace I/O
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _df_to_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
-    # Ensure index always has a name so it survives parquet round-trip
-    if df.index.name is None:
-        df = df.copy()
-        df.index.name = "Date"
     df.to_parquet(buf, index=True, engine="pyarrow")
     return buf.getvalue()
 
 
 def upload_parquet(df: pd.DataFrame, hf_path: str, commit_msg: str) -> None:
     api = HfApi(token=cfg.HF_TOKEN)
-    data = _df_to_bytes(df)
     api.upload_file(
-        path_or_fileobj=data,
+        path_or_fileobj=_df_to_bytes(df),
         path_in_repo=hf_path,
         repo_id=cfg.HF_DATASET_REPO,
         repo_type="dataset",
@@ -449,43 +531,22 @@ def load_parquet(hf_path: str) -> pd.DataFrame:
         force_download=True,
     )
     df = pd.read_parquet(local)
-
-    # FIX: real dates may be stored in a column called 'index'
-    # caused by double reset_index() on save — recover them first
-    if "index" in df.columns:
-        candidate = pd.to_datetime(df["index"], errors="coerce")
-        if candidate.notna().any() and candidate.dropna().dt.year.min() >= 1990:
-            df = df.drop(columns=[df.index.name] if df.index.name else [])
-            df["index"] = candidate
-            df = df.dropna(subset=["index"])
-            df = df.set_index("index")
-            df.index.name = "Date"
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
-            df = df[~df.index.duplicated(keep="last")]
-            logger.info(f"load_parquet({hf_path}): recovered dates from 'index' column, "
-                       f"range={df.index[0].date()} → {df.index[-1].date()}")
-            return df
-
-    # Handle date stored as a named column
-    for col in ["Date", "date", "datetime"]:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-            df = df.dropna(subset=[col])
-            df = df.set_index(col)
-            break
-
-    # Reject fake epoch index (integer index misread as nanosecond timestamps)
-    if isinstance(df.index, pd.DatetimeIndex) and len(df) > 0 and df.index[0].year < 1990:
-        raise ValueError(
-            f"load_parquet({hf_path}): index looks like epoch integers, not real dates. "
-            f"Sample: {df.index[:3].tolist()}. "
-            f"The file was likely saved with a plain integer index. "
-            f"Run the fix_macro_derived workflow to repair it."
-        )
-
+    if "Date" in df.columns:
+        df = df.set_index("Date")
     df.index = pd.to_datetime(df.index)
-    df.index.name = "Date"
-    df = df.sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    return df
+    return df.sort_index()
+
+
+def load_metadata() -> dict:
+    try:
+        local = hf_hub_download(
+            repo_id=cfg.HF_DATASET_REPO,
+            filename=cfg.FILE_METADATA,
+            repo_type="dataset",
+            token=cfg.HF_TOKEN,
+            force_download=True,
+        )
+        with open(local) as f:
+            return json.load(f)
+    except Exception:
+        return {}
