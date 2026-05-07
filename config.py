@@ -47,6 +47,8 @@ EQ_ETFS = [
     "GDX",   # Gold Miners
     "XLB",   # Basic Materials
     "IWF",
+    "IWD",
+    "IWO",
     "XSD",
     "XBI",
     "XLRE",  # Real Estate
