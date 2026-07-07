@@ -2,7 +2,7 @@ name: Daily Train and Predict
 
 on:
   schedule:
-    - cron: "10 00 * * 1-6"   # 01:00 UTC Mon-Fri (after data update at 22:00)
+    - cron: "10 22 * * 1-6"   # 01:00 UTC Mon-Fri (after data update at 22:00)
   workflow_dispatch:
     inputs:
       option:
