@@ -50,6 +50,8 @@ EQ_ETFS = [
     "IWD",
     "IWO",
     "XSD",
+    "SMH",
+    "SOXX",
     "XBI",
     "XLRE",  # Real Estate
     "IWM",   # Russell 2000
