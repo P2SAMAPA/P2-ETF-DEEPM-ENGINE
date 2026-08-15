@@ -53,6 +53,7 @@ EQ_ETFS = [
     "SMH",
     "SOXX",
     "XBI",
+    "IBB",
     "URA",
     "XLRE",  # Real Estate
     "IWM",   # Russell 2000
