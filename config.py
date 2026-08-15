@@ -54,6 +54,18 @@ EQ_ETFS = [
     "SOXX",
     "XBI",
     "IBB",
+    "VUG",
+    "VTV",
+    "SPYG",
+    "QUAL",
+    "IWR",
+    "VO",
+    "VB",
+    "VIG",
+    "VEA",
+    "VGT",
+    "VDE",
+    "XLC",
     "URA",
     "XLRE",  # Real Estate
     "IWM",   # Russell 2000
