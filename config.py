@@ -67,6 +67,8 @@ EQ_ETFS = [
     "VDE",
     "XLC",
     "URA",
+    "CPER",
+    "COPX",
     "XLRE",  # Real Estate
     "IWM",   # Russell 2000
     "XME",   # Metals & Mining
