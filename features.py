@@ -46,18 +46,26 @@ def build_asset_features(log_returns: pd.DataFrame, vol: pd.DataFrame) -> pd.Dat
 
     asset_features = pd.concat(frames, axis=1)
 
-    # Cross-sectional momentum z-score (rank-based)
-    ret_1d_cols = [c for c in asset_features.columns if c.endswith("_logret_1d")]
+    # ── Cross-sectional momentum z-score (rank-based) ──────────────────────────
+    # Build all new columns in a dict, then concat ONCE. This avoids
+    # fragmenting `asset_features` with repeated column insertions
+    # (which previously caused a PerformanceWarning and 6h timeouts).
+    ret_1d_cols  = [c for c in asset_features.columns if c.endswith("_logret_1d")]
     ret_21d_cols = [c for c in asset_features.columns if c.endswith("_logret_21d")]
 
-    for cols, suffix in [(ret_1d_cols, "mom1d_zrank"), (ret_21d_cols, "mom21d_zrank")]:
-        rank_df = asset_features[cols].rank(axis=1, pct=True) * 2 - 1  # scale to [-1, 1]
-        rank_df.columns = [c.replace(c.split("_")[-2] + "_" + c.split("_")[-1], suffix)
-                           for c in cols]
-        # Rename properly
-        for orig, col in zip(cols, rank_df.columns):
+    new_cols = {}
+    for cols, suffix in [(ret_1d_cols, "mom1d_zrank"),
+                         (ret_21d_cols, "mom21d_zrank")]:
+        if not cols:
+            continue
+        rank_df = asset_features[cols].rank(axis=1, pct=True) * 2 - 1  # [-1, 1]
+        for orig, rank_col in zip(cols, rank_df.columns):
             ticker = orig.split("_")[0]
-            asset_features[f"{ticker}_{suffix}"] = rank_df[col]
+            new_cols[f"{ticker}_{suffix}"] = rank_df[rank_col].values
+
+    if new_cols:
+        new_df = pd.DataFrame(new_cols, index=asset_features.index)
+        asset_features = pd.concat([asset_features, new_df], axis=1)
 
     return asset_features.dropna(how="all")
 
