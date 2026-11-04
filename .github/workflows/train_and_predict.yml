@@ -11,24 +11,19 @@ on:
         default: "both"
 
 jobs:
-  train-predict:
+  # 1. Standard Training (runs in parallel with windows training)
+  train-standard:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 hours max for both options
-
+    timeout-minutes: 120
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
-      - name: Install dependencies
-        run: pip install -r requirements_train.txt
-
-      - name: Train DeePM (evar + sharpe, auto-select best per option)
+      - run: pip install -r requirements_train.txt
+      
+      - name: Train DeePM (evar + sharpe)
         env:
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
           FRED_API_KEY:    ${{ secrets.FRED_API_KEY }}
@@ -37,14 +32,81 @@ jobs:
           OPTION="${{ github.event.inputs.option || 'both' }}"
           python train.py --option $OPTION --loss both
 
-      - name: Train DeePM shrinking windows (auto-select best window)
+  # 2. Window Training (Matrix Parallelization)
+  train-windows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false # Don't cancel other windows if one fails
+      matrix:
+        # Creates a combination of: [A, B] x [1-8] x [evar, sharpe] = 32 parallel jobs
+        option: [A, B]
+        window: [1, 2, 3, 4, 5, 6, 7, 8]
+        loss: [evar, sharpe]
+        exclude:
+          # Skip Option B entirely if workflow dispatch only asks for A
+          - option: B
+            window: 1 # Placeholder, handled inside the run step
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install -r requirements_train.txt
+
+      - name: Train Single Window
+        env:
+          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
+          FRED_API_KEY:    ${{ secrets.FRED_API_KEY }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+        run: |
+          REQUESTED_OPT="${{ github.event.inputs.option || 'both' }}"
+          CURRENT_OPT="${{ matrix.option }}"
+          
+          # Skip if user only requested A but this job is B, or vice versa
+          if [ "$REQUESTED_OPT" != "both" ] && [ "$REQUESTED_OPT" != "$CURRENT_OPT" ]; then
+            echo "Skipping Option $CURRENT_OPT because only $REQUESTED_OPT was requested."
+            exit 0
+          fi
+          
+          python train_windows.py --option $CURRENT_OPT --window ${{ matrix.window }} --loss ${{ matrix.loss }}
+
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: window-results-${{ matrix.option }}-w${{ matrix.window }}-${{ matrix.loss }}
+          path: models/*w${{ matrix.window }}_${{ matrix.loss }}*
+          retention-days: 1
+
+  # 3. Aggregate, Predict, and Upload (Runs only after ALL training finishes)
+  aggregate-and-predict:
+    needs: [train-standard, train-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install -r requirements_train.txt
+
+      - name: Download all window artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: window-results-*
+          merge-multiple: true
+          path: models/
+
+      - name: Aggregate Window Results
         env:
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
           FRED_API_KEY:    ${{ secrets.FRED_API_KEY }}
           HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
         run: |
           OPTION="${{ github.event.inputs.option || 'both' }}"
-          python train_windows.py --option $OPTION
+          python train_windows.py --aggregate --option $OPTION
 
       - name: Generate daily signals
         env:
