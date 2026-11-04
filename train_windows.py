@@ -1,12 +1,5 @@
 # train_windows.py — Shrinking window training for DeePM
-# Trains 8 models per option (FI / Equity), each on a progressively
-# shorter training window, all evaluated on the same OOS period (2025-present).
-# Winner = highest OOS annualised return.
-#
-# Usage:
-#   python train_windows.py --option A
-#   python train_windows.py --option B
-#   python train_windows.py --option both
+# Refactored to support parallel execution in GitHub Actions.
 
 import argparse
 import json
@@ -29,60 +22,36 @@ from train import train_epoch, eval_epoch, DEVICE
 
 os.makedirs(cfg.MODELS_DIR, exist_ok=True)
 
-# ── Shrinking window definitions ───────────────────────────────────────────────
-WINDOWS = [
-    {"id": 1, "train_start": "2008-01-01", "train_end": "2024-12-31"},
-    {"id": 2, "train_start": "2010-01-01", "train_end": "2024-12-31"},
-    {"id": 3, "train_start": "2012-01-01", "train_end": "2024-12-31"},
-    {"id": 4, "train_start": "2014-01-01", "train_end": "2024-12-31"},
-    {"id": 5, "train_start": "2016-01-01", "train_end": "2024-12-31"},
-    {"id": 6, "train_start": "2018-01-01", "train_end": "2024-12-31"},
-    {"id": 7, "train_start": "2020-01-01", "train_end": "2024-12-31"},
-    {"id": 8, "train_start": "2022-01-01", "train_end": "2024-12-31"},
-]
+WINDOWS = {
+    1: {"train_start": "2008-01-01", "train_end": "2024-12-31"},
+    2: {"train_start": "2010-01-01", "train_end": "2024-12-31"},
+    3: {"train_start": "2012-01-01", "train_end": "2024-12-31"},
+    4: {"train_start": "2014-01-01", "train_end": "2024-12-31"},
+    5: {"train_start": "2016-01-01", "train_end": "2024-12-31"},
+    6: {"train_start": "2018-01-01", "train_end": "2024-12-31"},
+    7: {"train_start": "2020-01-01", "train_end": "2024-12-31"},
+    8: {"train_start": "2022-01-01", "train_end": "2024-12-31"},
+}
 
 OOS_START = cfg.LIVE_START   # 2025-01-01
-OOS_END   = None              # today
 
 
-def make_window_dataloaders(
-    feat_dict: dict,
-    scaler,
-    train_start: str,
-    train_end: str,
-    oos_start: str,
-) -> tuple:
-    """
-    Split sequences into train (train_start→train_end) and
-    OOS (oos_start→today) based on dates array.
-    """
+def make_window_dataloaders(feat_dict, scaler, train_start, train_end, oos_start):
     dates    = feat_dict["dates"]
     X_asset  = feat_dict["X_asset"]
     X_macro  = feat_dict["X_macro"]
     y        = feat_dict["y"]
 
-    train_mask = (dates >= np.datetime64(train_start)) & \
-                 (dates <= np.datetime64(train_end))
+    train_mask = (dates >= np.datetime64(train_start)) & (dates <= np.datetime64(train_end))
     oos_mask   = dates >= np.datetime64(oos_start)
 
-    # Require minimum training size
     n_train = train_mask.sum()
-    n_oos   = oos_mask.sum()
-
     if n_train < cfg.LOOKBACK * 2:
-        raise ValueError(
-            f"Window {train_start}→{train_end} has only {n_train} training samples — too few."
-        )
+        raise ValueError(f"Window {train_start} has only {n_train} samples — too few.")
 
-    Xa_tr = X_asset[train_mask]
-    Xm_tr = X_macro[train_mask]
-    y_tr  = y[train_mask]
+    Xa_tr, Xm_tr, y_tr = X_asset[train_mask], X_macro[train_mask], y[train_mask]
+    Xa_oos, Xm_oos, y_oos = X_asset[oos_mask], X_macro[oos_mask], y[oos_mask]
 
-    Xa_oos = X_asset[oos_mask]
-    Xm_oos = X_macro[oos_mask]
-    y_oos  = y[oos_mask]
-
-    # Fit scaler on train only
     Xa_tr_s, Xm_tr_s   = scaler.fit_transform(Xa_tr, Xm_tr)
     Xa_oos_s, Xm_oos_s = scaler.transform(Xa_oos, Xm_oos)
 
@@ -96,39 +65,23 @@ def make_window_dataloaders(
     train_dl = DataLoader(to_ds(Xa_tr_s,  Xm_tr_s,  y_tr),  batch_size=cfg.BATCH_SIZE, shuffle=False)
     oos_dl   = DataLoader(to_ds(Xa_oos_s, Xm_oos_s, y_oos), batch_size=cfg.BATCH_SIZE, shuffle=False)
 
-    return train_dl, oos_dl, int(n_train), int(n_oos), dates[oos_mask]
+    return train_dl, oos_dl, int(n_train), int(oos_mask.sum()), dates[oos_mask]
 
 
-def train_single_window(
-    window: dict,
-    feat_dict: dict,
-    data: dict,
-    option: str,
-    loss_fn: str,
-) -> dict:
-    """Train DeePM on a single window. Returns summary with OOS metrics."""
-    wid = window["id"]
-    print(f"\n  Window {wid}: {window['train_start']} → {window['train_end']} | loss={loss_fn}")
+def train_single_window(window_id, feat_dict, data, option, loss_fn):
+    window = WINDOWS[window_id]
+    print(f"\nTraining Option {option} | Window {window_id} | {window['train_start']}→{window['train_end']} | loss={loss_fn}")
 
     scaler = feat.FeatureScaler()
-
     try:
         train_dl, oos_dl, n_train, n_oos, oos_dates = make_window_dataloaders(
-            feat_dict, scaler,
-            train_start=window["train_start"],
-            train_end=window["train_end"],
-            oos_start=OOS_START,
+            feat_dict, scaler, window["train_start"], window["train_end"], OOS_START
         )
     except ValueError as e:
-        print(f"  Skipping window {wid}: {e}")
+        print(f"Skipping: {e}")
         return None
 
-    print(f"  Train: {n_train} days | OOS: {n_oos} days")
-
     cash_rate_mean = float(data["cash_rate"].mean())
-
-    # Build model
-    include_cash = False  # no CASH for either option
 
     model = DeePM(
         n_assets=feat_dict["n_assets"],
@@ -139,21 +92,15 @@ def train_single_window(
         graph_hidden_dim=cfg.GRAPH_HIDDEN_DIM,
         n_attn_heads=cfg.N_ATTN_HEADS,
         dropout=cfg.DROPOUT,
-        include_cash=include_cash,
+        include_cash=False,
     ).to(DEVICE)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
 
-    model_path = os.path.join(
-        cfg.MODELS_DIR, f"deepm_option{option}_w{wid}_{loss_fn}.pt"
-    )
+    model_path = os.path.join(cfg.MODELS_DIR, f"deepm_option{option}_w{window_id}_{loss_fn}.pt")
+    scaler_path = os.path.join(cfg.MODELS_DIR, f"scaler_option{option}_w{window_id}_{loss_fn}.pkl")
 
-    # Training loop — use train set, evaluate on OOS directly
     best_oos_return = -float("inf")
     patience_count  = 0
     cfg.LOSS_FN     = loss_fn
@@ -167,143 +114,111 @@ def train_single_window(
             best_oos_return = oos_ann_return
             patience_count  = 0
             torch.save(model.state_dict(), model_path)
+            with open(scaler_path, "wb") as f:
+                pickle.dump(scaler, f)
         else:
             patience_count += 1
 
         if patience_count >= cfg.PATIENCE:
             break
 
-    # Final OOS eval with best model
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-    _, oos_sharpe, oos_ann_return = eval_epoch(model, oos_dl, cash_rate_mean, loss_fn)
-
-    print(f"  Window {wid} result: OOS ann_return={oos_ann_return*100:.2f}% | Sharpe={oos_sharpe:.3f}")
-
-    return {
-        "window_id":      wid,
-        "train_start":    window["train_start"],
-        "train_end":      window["train_end"],
-        "oos_start":      OOS_START,
-        "loss_fn":        loss_fn,
-        "n_train":        n_train,
-        "n_oos":          n_oos,
-        "oos_ann_return": round(oos_ann_return, 4),
-        "oos_sharpe":     round(oos_sharpe, 4),
-        "model_path":     model_path,
-        "scaler":         scaler,
+    # Save results metric for aggregation
+    result = {
+        "window_id": window_id,
+        "train_start": window["train_start"],
+        "train_end": window["train_end"],
+        "loss_fn": loss_fn,
+        "n_train": n_train,
+        "n_oos": n_oos,
+        "oos_ann_return": round(best_oos_return, 4),
+        "oos_sharpe": round(oos_sharpe, 4),
     }
+    
+    res_path = os.path.join(cfg.MODELS_DIR, f"result_option{option}_w{window_id}_{loss_fn}.json")
+    with open(res_path, "w") as f:
+        json.dump(result, f)
+
+    print(f"Result: OOS ann_return={best_oos_return*100:.2f}% | Sharpe={oos_sharpe:.3f}")
+    return result
 
 
-def train_windows_option(option: str) -> dict:
-    """
-    Train all 8 shrinking windows for one option (A or B).
-    Tries both loss functions per window, picks best OOS return overall.
-    Saves winning model as canonical shrinking window model.
-    Returns full summary.
-    """
-    t0 = time.time()
-    print(f"\n{'='*60}")
-    print(f"DeePM Shrinking Windows — Option {'A (FI)' if option == 'A' else 'B (Equity)'}")
-    print(f"{'='*60}")
+def aggregate_and_save(option):
+    """Finds the best result from the downloaded JSON files, sets canonical model."""
+    print(f"\nAggregating results for Option {option}...")
+    
+    best_result = None
+    best_return = -float("inf")
+    all_results = []
 
-    # Load data + build features once
-    print("\n[1/2] Loading data and building features...")
-    master    = loader.load_master()
-    data      = loader.get_option_data(option, master)
-    feat_dict = feat.prepare_features(data, lookback=cfg.LOOKBACK)
-
-    print(f"\n[2/2] Training {len(WINDOWS)} windows × 2 loss functions...")
-
-    all_results  = []
-    best_result  = None
-    best_return  = -float("inf")
-
-    for window in WINDOWS:
+    for wid in WINDOWS.keys():
         for loss_fn in ["evar", "sharpe"]:
-            result = train_single_window(window, feat_dict, data, option, loss_fn)
-            if result is None:
+            res_path = os.path.join(cfg.MODELS_DIR, f"result_option{option}_w{wid}_{loss_fn}.json")
+            if not os.path.exists(res_path):
                 continue
-
-            all_results.append({k: v for k, v in result.items() if k != "scaler"})
-
-            if result["oos_ann_return"] > best_return:
-                best_return = result["oos_ann_return"]
-                best_result = result
+                
+            with open(res_path, "r") as f:
+                result = json.load(f)
+                all_results.append(result)
+                
+                if result["oos_ann_return"] > best_return:
+                    best_return = result["oos_ann_return"]
+                    best_result = result
 
     if best_result is None:
-        raise RuntimeError("All windows failed — no valid results.")
+        raise RuntimeError(f"No valid window results found for Option {option}.")
 
-    # Copy winning model to canonical shrinking window filename
-    canonical_model  = os.path.join(cfg.MODELS_DIR, f"deepm_option{option}_window_best.pt")
+    # Promote the winner to canonical filenames
+    wid = best_result["window_id"]
+    loss = best_result["loss_fn"]
+    
+    best_model_path = os.path.join(cfg.MODELS_DIR, f"deepm_option{option}_w{wid}_{loss}.pt")
+    best_scaler_path = os.path.join(cfg.MODELS_DIR, f"scaler_option{option}_w{wid}_{loss}.pkl")
+    
+    canonical_model = os.path.join(cfg.MODELS_DIR, f"deepm_option{option}_window_best.pt")
     canonical_scaler = os.path.join(cfg.MODELS_DIR, f"scaler_option{option}_window.pkl")
+    
+    shutil.copy2(best_model_path, canonical_model)
+    shutil.copy2(best_scaler_path, canonical_scaler)
 
-    shutil.copy2(best_result["model_path"], canonical_model)
-    with open(canonical_scaler, "wb") as f:
-        pickle.dump(best_result["scaler"], f)
-
-    elapsed = round(time.time() - t0, 1)
-
+    # Save final summary
     summary = {
-        "option":          option,
-        "trained_at":      datetime.utcnow().isoformat(),
-        "elapsed_sec":     elapsed,
-        "n_windows":       len(WINDOWS),
-        "winning_window":  best_result["window_id"],
-        "winning_train_start": best_result["train_start"],
-        "winning_train_end":   best_result["train_end"],
-        "winning_loss":    best_result["loss_fn"],
-        "oos_ann_return":  best_result["oos_ann_return"],
-        "oos_sharpe":      best_result["oos_sharpe"],
-        "all_windows":     all_results,
-        "n_assets":        feat_dict["n_assets"],
-        "tickers":         feat_dict["tickers"],
-        "include_cash":    (option == "A"),
-        "n_asset_feats":   feat_dict["n_asset_feats"],
-        "n_macro_feats":   feat_dict["n_macro_feats"],
-        "config": {
-            "lookback":         cfg.LOOKBACK,
-            "asset_hidden_dim": cfg.ASSET_HIDDEN_DIM,
-            "macro_hidden_dim": cfg.MACRO_HIDDEN_DIM,
-            "graph_hidden_dim": cfg.GRAPH_HIDDEN_DIM,
-        },
+        "option": option,
+        "trained_at": datetime.utcnow().isoformat(),
+        "winning_window": wid,
+        "winning_loss": loss,
+        "oos_ann_return": best_result["oos_ann_return"],
+        "oos_sharpe": best_result["oos_sharpe"],
+        "all_windows": all_results,
     }
-
-    meta_path = os.path.join(cfg.MODELS_DIR, f"meta_option{option}_window.json")
-    with open(meta_path, "w") as f:
+    
+    with open(os.path.join(cfg.MODELS_DIR, f"meta_option{option}_window.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"\n{'='*60}")
-    print(f"Option {option} shrinking windows complete in {elapsed}s")
-    print(f"  Winner: Window {best_result['window_id']} "
-          f"({best_result['train_start']} → {best_result['train_end']}) "
-          f"| loss={best_result['loss_fn']}")
-    print(f"  OOS ann return : {best_result['oos_ann_return']*100:.2f}%")
-    print(f"  OOS Sharpe     : {best_result['oos_sharpe']:.3f}")
-    print(f"{'='*60}")
-
-    return summary
+    print(f"Winner Option {option}: Window {wid} ({loss}) | OOS ann return: {best_return*100:.2f}%")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train DeePM shrinking windows")
-    parser.add_argument(
-        "--option",
-        choices=["A", "B", "both"],
-        default="both",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--option", choices=["A", "B", "both"], default="both")
+    parser.add_argument("--window", type=int, help="Specific window ID to train (1-8)")
+    parser.add_argument("--loss", choices=["evar", "sharpe"], help="Specific loss function")
+    parser.add_argument("--aggregate", action="store_true", help="Aggregate results instead of training")
     args = parser.parse_args()
 
     options = ["A", "B"] if args.option == "both" else [args.option]
 
-    summaries = {}
-    for opt in options:
-        summaries[opt] = train_windows_option(opt)
-
-    print("\n" + "="*60)
-    print("ALL SHRINKING WINDOW TRAINING COMPLETE")
-    for opt, s in summaries.items():
-        print(f"  Option {opt}: Window {s['winning_window']} "
-              f"({s['winning_train_start']}→{s['winning_train_end']}) "
-              f"| {s['winning_loss']} "
-              f"| OOS return={s['oos_ann_return']*100:.2f}%")
-    print("="*60)
+    if args.aggregate:
+        for opt in options:
+            aggregate_and_save(opt)
+    else:
+        if not args.window or not args.loss:
+            raise ValueError("Must provide --window and --loss to train, or --aggregate to merge.")
+            
+        # Load data only once per runner
+        master = loader.load_master()
+        
+        for opt in options:
+            data = loader.get_option_data(opt, master)
+            feat_dict = feat.prepare_features(data, lookback=cfg.LOOKBACK)
+            
+            train_single_window(args.window, feat_dict, data, opt, args.loss)
