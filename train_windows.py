@@ -122,7 +122,6 @@ def train_single_window(window_id, feat_dict, data, option, loss_fn):
         if patience_count >= cfg.PATIENCE:
             break
 
-    # Save results metric for aggregation
     result = {
         "window_id": window_id,
         "train_start": window["train_start"],
@@ -146,6 +145,11 @@ def aggregate_and_save(option):
     """Finds the best result from the downloaded JSON files, sets canonical model."""
     print(f"\nAggregating results for Option {option}...")
     
+    # Re-load features just to get the exact metadata for the final JSON
+    master = loader.load_master()
+    data = loader.get_option_data(option, master)
+    feat_dict = feat.prepare_features(data, lookback=cfg.LOOKBACK)
+
     best_result = None
     best_return = -float("inf")
     all_results = []
@@ -180,15 +184,29 @@ def aggregate_and_save(option):
     shutil.copy2(best_model_path, canonical_model)
     shutil.copy2(best_scaler_path, canonical_scaler)
 
-    # Save final summary
+    # Save final summary (MUST MATCH predict.py expectations)
     summary = {
-        "option": option,
-        "trained_at": datetime.utcnow().isoformat(),
-        "winning_window": wid,
-        "winning_loss": loss,
-        "oos_ann_return": best_result["oos_ann_return"],
-        "oos_sharpe": best_result["oos_sharpe"],
-        "all_windows": all_results,
+        "option":          option,
+        "trained_at":      datetime.utcnow().isoformat(),
+        "winning_window":  wid,
+        "winning_train_start": WINDOWS[wid]["train_start"],
+        "winning_train_end":   WINDOWS[wid]["train_end"],
+        "winning_loss":    loss,
+        "oos_ann_return":  best_result["oos_ann_return"],
+        "oos_sharpe":      best_result["oos_sharpe"],
+        "all_windows":     all_results,
+        # These keys were missing before, causing the KeyError in predict.py:
+        "n_assets":        feat_dict["n_assets"],
+        "tickers":         feat_dict["tickers"],
+        "include_cash":    False,
+        "n_asset_feats":   feat_dict["n_asset_feats"],
+        "n_macro_feats":   feat_dict["n_macro_feats"],
+        "config": {
+            "lookback":         cfg.LOOKBACK,
+            "asset_hidden_dim": cfg.ASSET_HIDDEN_DIM,
+            "macro_hidden_dim": cfg.MACRO_HIDDEN_DIM,
+            "graph_hidden_dim": cfg.GRAPH_HIDDEN_DIM,
+        },
     }
     
     with open(os.path.join(cfg.MODELS_DIR, f"meta_option{option}_window.json"), "w") as f:
@@ -214,7 +232,6 @@ if __name__ == "__main__":
         if not args.window or not args.loss:
             raise ValueError("Must provide --window and --loss to train, or --aggregate to merge.")
             
-        # Load data only once per runner
         master = loader.load_master()
         
         for opt in options:
