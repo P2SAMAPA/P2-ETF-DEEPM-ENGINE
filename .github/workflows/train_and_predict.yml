@@ -11,7 +11,7 @@ on:
         default: "both"
 
 jobs:
-  # 1. Standard Training (runs in parallel with windows training)
+  # 1. Standard Training
   train-standard:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -32,21 +32,25 @@ jobs:
           OPTION="${{ github.event.inputs.option || 'both' }}"
           python train.py --option $OPTION --loss both
 
+      - name: Upload standard models artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: standard-models
+          path: |
+            models/deepm_option*_best.pt
+            models/scaler_option*_best.pkl
+          retention-days: 1
+
   # 2. Window Training (Matrix Parallelization)
   train-windows:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
-      fail-fast: false # Don't cancel other windows if one fails
+      fail-fast: false
       matrix:
-        # Creates a combination of: [A, B] x [1-8] x [evar, sharpe] = 32 parallel jobs
         option: [A, B]
         window: [1, 2, 3, 4, 5, 6, 7, 8]
         loss: [evar, sharpe]
-        exclude:
-          # Skip Option B entirely if workflow dispatch only asks for A
-          - option: B
-            window: 1 # Placeholder, handled inside the run step
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -64,7 +68,6 @@ jobs:
           REQUESTED_OPT="${{ github.event.inputs.option || 'both' }}"
           CURRENT_OPT="${{ matrix.option }}"
           
-          # Skip if user only requested A but this job is B, or vice versa
           if [ "$REQUESTED_OPT" != "both" ] && [ "$REQUESTED_OPT" != "$CURRENT_OPT" ]; then
             echo "Skipping Option $CURRENT_OPT because only $REQUESTED_OPT was requested."
             exit 0
@@ -76,10 +79,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: window-results-${{ matrix.option }}-w${{ matrix.window }}-${{ matrix.loss }}
-          path: models/*w${{ matrix.window }}_${{ matrix.loss }}*
+          path: |
+            models/*w${{ matrix.window }}_${{ matrix.loss }}*
+            models/result_option*
           retention-days: 1
 
-  # 3. Aggregate, Predict, and Upload (Runs only after ALL training finishes)
+  # 3. Aggregate, Predict, and Upload
   aggregate-and-predict:
     needs: [train-standard, train-windows]
     runs-on: ubuntu-latest
@@ -92,7 +97,13 @@ jobs:
           cache: "pip"
       - run: pip install -r requirements_train.txt
 
-      - name: Download all window artifacts
+      - name: Download Standard Models
+        uses: actions/download-artifact@v4
+        with:
+          name: standard-models
+          path: models/
+
+      - name: Download Window Artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: window-results-*
