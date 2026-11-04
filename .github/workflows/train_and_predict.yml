@@ -38,8 +38,8 @@ jobs:
           name: standard-models
           path: |
             models/deepm_option*_best.pt
-            models/scaler_option*_best.pkl
-            models/meta_*.json
+            models/scaler_option*.pkl
+            models/meta_option*.json
           retention-days: 1
 
   # 2. Window Training (Matrix Parallelization)
